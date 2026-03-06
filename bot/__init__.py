@@ -1,0 +1,1 @@
+"""Signal group welcome bot."""
