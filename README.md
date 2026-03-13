@@ -64,21 +64,6 @@ When a new commit is detected:
 
 ---
 
-# Repository Structure
-
-Example structure:
-
-```
-.
-├─ flake.nix
-├─ flake.lock
-├─ requirements.txt
-└─ bot/
-   └─ main.py
-```
-
----
-
 # Server Setup
 
 These steps are only needed once.
@@ -243,6 +228,28 @@ After editing:
 sudo systemctl daemon-reload
 sudo systemctl restart bot.service
 ```
+
+---
+
+# Link the bot to Signal
+
+The bot should run as a **linked device** on an existing Signal account. Do this once on the server, as the same user that runs the service (default `ubuntu`).
+
+1. Generate a QR code on the server:
+
+```
+signal-cli link -n "veganactivistsnl-bot"
+```
+
+2. On your phone: Signal → Settings → Linked devices → **Link new device**, then scan the QR code.
+
+3. Confirm the link worked:
+
+```
+signal-cli listDevices
+```
+
+Signal state is stored under `~/.local/share/signal-cli`, so the same user must run the bot and the linking step.
 
 ---
 

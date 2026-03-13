@@ -150,6 +150,36 @@
         '';
       };
     in {
+      devShells.default = pkgs.mkShell {
+        packages = [
+          pkgs.bash
+          pkgs.coreutils
+          pkgs.git
+          pkgs.python3
+          pkgs.signal-cli
+        ];
+        shellHook = ''
+          set -euo pipefail
+
+          venv_dir="$PWD/.venv"
+          if [ ! -d "$venv_dir" ]; then
+            python -m venv "$venv_dir"
+          fi
+
+          # Activate venv
+          source "$venv_dir/bin/activate"
+
+          python -m pip install -U pip wheel setuptools
+
+          if [ -f requirements.txt ]; then
+            python -m pip install -r requirements.txt
+          fi
+
+          if [ -f requirements-dev.txt ]; then
+            python -m pip install -r requirements-dev.txt
+          fi
+        '';
+      };
       apps = {
         install = {
           type = "app";
