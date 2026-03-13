@@ -149,7 +149,7 @@ nix run .#run
 By default the bot stores its JSON state at `data/group_state.json`. Override it with:
 
 ```
-python -m bot.main --state-path /srv/bot/data/group_state.json
+python -m bot --state-path /srv/bot/data/group_state.json
 ```
 
 ---
@@ -214,6 +214,7 @@ Example content:
 
 ```
 SIGNAL_ACCOUNT=+123456789
+BOT_STATE_FILE=/srv/bot/data/group_state.json
 ```
 
 To enable this, ensure the systemd unit contains:
@@ -227,6 +228,14 @@ After editing:
 ```
 sudo systemctl daemon-reload
 sudo systemctl restart bot.service
+```
+
+## CLI options
+
+You can also pass configuration via CLI flags (these override environment variables):
+
+```
+python -m bot --account +123456789 --state-path /srv/bot/data/group_state.json
 ```
 
 ---

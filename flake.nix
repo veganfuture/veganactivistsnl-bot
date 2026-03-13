@@ -39,15 +39,12 @@
           # Activate venv
           source "${venvDir}/bin/activate"
 
-          # Ensure pip tooling is present/up to date
-          python -m pip install -U pip wheel setuptools
-
           # Install deps (fast when already satisfied)
           if [ -f requirements.txt ]; then
             python -m pip install -r requirements.txt
           fi
 
-          exec python -m bot.main
+          exec python -m bot
         '';
       };
 
@@ -150,6 +147,9 @@
         '';
       };
     in {
+      packages = {
+        signal-cli = pkgs.signal-cli;
+      };
       devShells.default = pkgs.mkShell {
         packages = [
           pkgs.bash

@@ -25,6 +25,9 @@ class SignalGroup(BaseModel):
     def resolved_id(self) -> str | None:
         return self.group_id_v2 or self.group_id or self.id
 
+    def get_member_ids(self) -> set[str]:
+        return normalize_member_set(self.members)
+
 
 class GroupList(BaseModel):
     groups: list[SignalGroup] = Field(default_factory=list)
@@ -54,6 +57,31 @@ class Envelope(BaseModel):
 
 class SignalPayload(BaseModel):
     envelope: Envelope | None = None
+
+    def extract_group_id(self) -> str | None:
+        envelope = self.envelope
+        if not envelope or not envelope.data_message:
+            return None
+        data_message = envelope.data_message
+        group_info = data_message.group_info
+        if group_info and (group_info.group_id or group_info.group_id_v2):
+            return group_info.group_id or group_info.group_id_v2
+        group_v2 = data_message.group_v2
+        if group_v2 and (group_v2.group_id or group_v2.group_id_v2):
+            return group_v2.group_id or group_v2.group_id_v2
+        return data_message.group_id
+
+    def is_group_update(self) -> bool:
+        envelope = self.envelope
+        if not envelope or not envelope.data_message:
+            return False
+        data_message = envelope.data_message
+        group_info = data_message.group_info
+        if group_info and group_info.type == "UPDATE":
+            return True
+        if data_message.group_change or data_message.group_v2:
+            return True
+        return False
 
 
 @dataclass
@@ -96,11 +124,11 @@ class SignalCliClient:
         result = await self._run(*args)
         return json.loads(result.stdout)
 
-    async def list_groups(self) -> list[SignalGroup]:
-        commands = [
-            ["signal-cli", "-u", self.account, "-o", "json", "listGroupsV2"],
-            ["signal-cli", "-u", self.account, "-o", "json", "listGroups"],
-        ]
+    async def list_groups(self, group_id: str | None = None) -> list[SignalGroup]:
+        base_command = ["signal-cli", "-u", self.account, "-o", "json", "listGroups"]
+        if group_id:
+            base_command.extend(["-g", group_id])
+        commands = [base_command]
         last_error: Exception | None = None
         for cmd in commands:
             try:
@@ -109,13 +137,25 @@ class SignalCliClient:
                 last_error = exc
                 continue
             if isinstance(data, list):
-                return [SignalGroup.model_validate(item) for item in data if isinstance(item, dict)]
+                return [
+                    SignalGroup.model_validate(item)
+                    for item in data
+                    if isinstance(item, dict)
+                ]
             if isinstance(data, dict):
                 parsed = GroupList.model_validate(data)
                 return parsed.groups
         if last_error:
             raise last_error
         return []
+
+    async def get_group_by_id(self, group_id: str) -> SignalGroup | None:
+        all_groups = await self.list_groups(group_id=group_id)
+        return next((g for g in all_groups if g.resolved_id == group_id), None)
+
+    async def get_group_by_name(self, group_name: str) -> SignalGroup | None:
+        all_groups = await self.list_groups()
+        return next((g for g in all_groups if g.name == group_name), None)
 
     async def send_group_message(self, group_id: str, message: str) -> None:
         await self._run(
@@ -127,6 +167,14 @@ class SignalCliClient:
             message,
             "-g",
             group_id,
+        )
+
+    async def send_sync_request(self) -> None:
+        await self._run(
+            "signal-cli",
+            "-u",
+            self.account,
+            "sendSyncRequest",
         )
 
     async def receive_events(self) -> AsyncIterator[SignalPayload]:
@@ -194,35 +242,18 @@ class SignalCliClient:
 
 
 def normalize_member_set(members: Iterable[GroupMember]) -> set[str]:
-    return {
-        member.uuid or member.number
-        for member in members
-        if member.uuid or member.number
-    }
+    result = set()
+    for member in members:
+        member_id = member.uuid or member.number
+        if member_id is None:
+            continue
+        result.add(member_id)
+    return result
 
 
 def extract_group_id(payload: SignalPayload) -> str | None:
-    envelope = payload.envelope
-    if not envelope or not envelope.data_message:
-        return None
-    data_message = envelope.data_message
-    group_info = data_message.group_info
-    if group_info and (group_info.group_id or group_info.group_id_v2):
-        return group_info.group_id or group_info.group_id_v2
-    group_v2 = data_message.group_v2
-    if group_v2 and (group_v2.group_id or group_v2.group_id_v2):
-        return group_v2.group_id or group_v2.group_id_v2
-    return data_message.group_id
+    return payload.extract_group_id()
 
 
 def should_check_group(payload: SignalPayload) -> bool:
-    envelope = payload.envelope
-    if not envelope or not envelope.data_message:
-        return False
-    data_message = envelope.data_message
-    group_info = data_message.group_info
-    if group_info and group_info.type == "UPDATE":
-        return True
-    if data_message.group_change or data_message.group_v2:
-        return True
-    return False
+    return payload.is_group_update()
