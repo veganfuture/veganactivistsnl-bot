@@ -51,7 +51,9 @@
             python -m pip install -r requirements.txt
           fi
 
-          exec python -m bot
+          exec python -m bot \
+            --signal-client-mode daemon \
+            --signal-daemon-socket-path "${signalSocketPath}"
         '';
       };
 
