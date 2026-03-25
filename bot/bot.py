@@ -100,9 +100,7 @@ async def _run(config: BotConfig) -> None:
         except RuntimeError as exc:
             logger.error("Error flushing pending welcomes: {}", exc)
         if config.receive_poll_delay_seconds > 0:
-            logger.debug("sleep")
             await asyncio.sleep(config.receive_poll_delay_seconds)
-            logger.debug("receive")
 
 
 async def _seed_state(client: SignalClient, welcome_group: str) -> BotState:
