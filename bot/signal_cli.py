@@ -345,6 +345,8 @@ class SignalRpcClient(SignalClient):
     ) -> None:
         super().__init__(account, command_timeout_seconds, receive_timeout_seconds)
         self.socket_path = socket_path
+        self.connect_retry_seconds = 30.0
+        self.connect_retry_interval_seconds = 0.5
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._read_task: asyncio.Task[None] | None = None
@@ -399,10 +401,36 @@ class SignalRpcClient(SignalClient):
     async def _ensure_connected(self) -> None:
         if self._writer is not None and not self._writer.is_closing():
             return
-        reader, writer = await asyncio.open_unix_connection(str(self.socket_path))
-        self._reader = reader
-        self._writer = writer
-        self._read_task = asyncio.create_task(self._read_loop())
+        deadline = time.monotonic() + self.connect_retry_seconds
+        last_error: OSError | None = None
+        while True:
+            try:
+                reader, writer = await asyncio.open_unix_connection(str(self.socket_path))
+            except OSError as exc:
+                last_error = exc
+                if time.monotonic() >= deadline:
+                    break
+                logger.info(
+                    "Waiting for signal-cli daemon socket {}: {}",
+                    self.socket_path,
+                    exc,
+                )
+                await asyncio.sleep(self.connect_retry_interval_seconds)
+                continue
+            self._reader = reader
+            self._writer = writer
+            self._read_task = asyncio.create_task(self._read_loop())
+            return
+        message = (
+            f"Could not connect to signal-cli daemon socket {self.socket_path} "
+            f"within {self.connect_retry_seconds:.1f}s"
+        )
+        if last_error is not None:
+            message = f"{message}: {last_error}"
+        raise SignalCliError(
+            message,
+            CommandResult(stdout="", stderr=message, returncode=-1),
+        )
 
     async def _request(self, method: str, params: dict[str, object] | None = None) -> object:
         await self._ensure_connected()

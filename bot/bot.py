@@ -53,6 +53,7 @@ def run_bot(config: BotConfig) -> None:
 
 async def _run(config: BotConfig) -> None:
     logger.info("Starting signal bot for account {}", config.account)
+    logger.info("Bot config: {}", config)
 
     client = create_signal_client(
         mode=config.signal_client_mode,
