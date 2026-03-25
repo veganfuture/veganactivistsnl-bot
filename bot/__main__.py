@@ -8,7 +8,16 @@ from loguru import logger
 from bot.bot import BotConfig, run_bot
 
 DEFAULT_STATE_MAX_AGE_SECONDS = 15 * 60
-DEFAULT_WELCOME_MESSAGE = "Welcome {{newusers}} to the group!"
+DEFAULT_WELCOME_MESSAGE = (
+    "Welcome {{newusers}} to the Vegan Activists NL community 💚\n\n"
+    "Here are our main Signal groups:\n"
+    "• Chat – for general discussion: https://veganactivists.nl/chat\n"
+    "• Events – for sharing and discovering events: https://veganactivists.nl/events\n"
+    "• Amsterdam – for Amsterdam-based activism: https://veganactivists.nl/amsterdam\n\n"
+    "We have many non-Dutch speakers, so we encourage using English to keep conversations inclusive. Dutch is of course also welcome!\n\n"
+    "To help you get started, we’d love for you to introduce yourself and share your interest in activism. This way we can better support you.\n\n"
+    "This intro group is just to welcome you and help you find your way. It’s not meant for ongoing discussion, so feel free to leave once you're ready to join the other groups."
+)
 DEFAULT_WELCOME_GROUP = "Intro - Vegan Activists NL"
 DEFAULT_WELCOME_MESSAGE_MIN_INTERVAL_SECONDS = 90
 DEFAULT_SYNC_ON_STARTUP = True
