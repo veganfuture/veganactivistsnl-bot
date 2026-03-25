@@ -81,18 +81,26 @@
 
       pollOnce = pkgs.writeShellApplication {
         name = "bot-poll-once";
-        runtimeInputs = runtimePkgs ++ [pkgs.systemd pkgs.nix];
+        runtimeInputs = runtimePkgs ++ [pkgs.systemd pkgs.nix pkgs.util-linux];
         text = ''
           set -euo pipefail
-          cd "${repoDir}"
+
+          if [ -z "''${BOT_USER:-}" ]; then
+            echo "BOT_USER must be set" >&2
+            exit 1
+          fi
 
           REMOTE="origin"
           BRANCH="main"
 
-          git fetch "$REMOTE" "$BRANCH"
+          run_as_bot_user() {
+            runuser -u "$BOT_USER" -- "$@"
+          }
 
-          localRev="$(git rev-parse HEAD)"
-          remoteRev="$(git rev-parse "$REMOTE/$BRANCH")"
+          run_as_bot_user git -C "${repoDir}" fetch "$REMOTE" "$BRANCH"
+
+          localRev="$(run_as_bot_user git -C "${repoDir}" rev-parse HEAD)"
+          remoteRev="$(run_as_bot_user git -C "${repoDir}" rev-parse "$REMOTE/$BRANCH")"
 
           if [ "$localRev" = "$remoteRev" ]; then
             echo "No changes ($localRev)."
@@ -100,7 +108,7 @@
           fi
 
           echo "Updating: $localRev -> $remoteRev"
-          git reset --hard "$REMOTE/$BRANCH"
+          run_as_bot_user git -C "${repoDir}" reset --hard "$REMOTE/$BRANCH"
 
           # Restart the daemon and bot so both pick up code/config changes.
           systemctl restart signal-cli-daemon.service
@@ -171,8 +179,8 @@
 
         [Service]
         Type=oneshot
-        User=ubuntu
         WorkingDirectory=${repoDir}
+        Environment=BOT_USER=ubuntu
         ExecStart=${pollOnce}/bin/bot-poll-once
       '';
 
@@ -201,7 +209,7 @@
 
           sed "s/^User=.*/User=$bot_user/" ${serviceUnit} > "$temp_dir/bot.service"
           sed "s/^User=.*/User=$bot_user/" ${daemonServiceUnit} > "$temp_dir/signal-cli-daemon.service"
-          sed "s/^User=.*/User=$bot_user/" ${pollServiceUnit} > "$temp_dir/bot-poll.service"
+          sed "s/^Environment=BOT_USER=.*/Environment=BOT_USER=$bot_user/" ${pollServiceUnit} > "$temp_dir/bot-poll.service"
 
           sudo install -m 0644 "$temp_dir/bot.service" /etc/systemd/system/bot.service
           sudo install -m 0644 "$temp_dir/signal-cli-daemon.service" /etc/systemd/system/signal-cli-daemon.service
