@@ -253,6 +253,13 @@
           if [ -f requirements-dev.txt ]; then
             python -m pip install -r requirements-dev.txt
           fi
+
+          if [ -f .env ]; then
+            set -a
+            # shellcheck disable=SC1091
+            source .env
+            set +a
+          fi
         '';
       };
       apps = {
