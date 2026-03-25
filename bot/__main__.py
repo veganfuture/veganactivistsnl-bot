@@ -5,14 +5,15 @@ from pathlib import Path
 
 from loguru import logger
 
-from bot.bot import run_bot
+from bot.bot import BotConfig, run_bot
 
 DEFAULT_STATE_MAX_AGE_SECONDS = 15 * 60
 DEFAULT_WELCOME_MESSAGE = "Welcome {{newusers}} to the group!"
 DEFAULT_WELCOME_GROUP = "Intro - Vegan Activists NL"
+DEFAULT_WELCOME_MESSAGE_MIN_INTERVAL_SECONDS = 90
 DEFAULT_SYNC_ON_STARTUP = True
 DEFAULT_SIGNAL_CLI_TIMEOUT_SECONDS = 30.0
-DEFAULT_SIGNAL_RECEIVE_TIMEOUT_SECONDS = 1
+DEFAULT_SIGNAL_RECEIVE_TIMEOUT_SECONDS = 2
 DEFAULT_RECEIVE_POLL_DELAY_SECONDS = 0.2
 
 
@@ -26,6 +27,10 @@ def main() -> None:
         raise ValueError("WELCOME_GROUP is required, set it or use --welcome-group")
     if not args.welcome_message:
         raise ValueError("WELCOME_MESSAGE is required, set it or use --welcome-message")
+    if args.welcome_message_min_interval_seconds <= 0:
+        raise ValueError(
+            "--welcome-message-min-interval-seconds must be greater than zero"
+        )
     if args.state_max_age_seconds <= 0:
         raise ValueError("--state-max-age-seconds must be greater than zero")
     if args.signal_cli_timeout_seconds <= 0:
@@ -34,17 +39,19 @@ def main() -> None:
         raise ValueError("--signal-receive-timeout-seconds must be greater than zero")
     if args.receive_poll_delay_seconds < 0:
         raise ValueError("--receive-poll-delay-seconds must be zero or greater")
-    run_bot(
+    config = BotConfig(
         account=args.account,
         state_path=args.state_path,
         welcome_group=args.welcome_group,
         welcome_message=args.welcome_message,
+        welcome_message_min_interval_seconds=args.welcome_message_min_interval_seconds,
         state_max_age_seconds=args.state_max_age_seconds,
         sync_on_startup=args.sync_on_startup,
         signal_cli_timeout_seconds=args.signal_cli_timeout_seconds,
         signal_receive_timeout_seconds=args.signal_receive_timeout_seconds,
         receive_poll_delay_seconds=args.receive_poll_delay_seconds,
     )
+    run_bot(config)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -69,6 +76,20 @@ def _parse_args() -> argparse.Namespace:
         "--welcome-message",
         default=os.environ.get("WELCOME_MESSAGE", DEFAULT_WELCOME_MESSAGE),
         help="Message template to send (or set WELCOME_MESSAGE)",
+    )
+    parser.add_argument(
+        "--welcome-message-min-interval-seconds",
+        type=int,
+        default=int(
+            os.environ.get(
+                "WELCOME_MESSAGE_MIN_INTERVAL_SECONDS",
+                DEFAULT_WELCOME_MESSAGE_MIN_INTERVAL_SECONDS,
+            )
+        ),
+        help=(
+            "Minimum interval between welcome messages in seconds "
+            "(or set WELCOME_MESSAGE_MIN_INTERVAL_SECONDS)"
+        ),
     )
     parser.add_argument(
         "--state-max-age-seconds",

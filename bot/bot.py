@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from dataclasses import dataclass
 from pathlib import Path
 import re
 
@@ -11,65 +12,56 @@ from pydantic import BaseModel, Field
 from bot.signal_cli import ContactRecipient, GroupMember, SignalCliClient, SignalPayload
 
 
-def run_bot(
-    account: str,
-    state_path: Path,
-    welcome_group: str,
-    welcome_message: str,
-    state_max_age_seconds: int,
-    sync_on_startup: bool,
-    signal_cli_timeout_seconds: float,
-    signal_receive_timeout_seconds: int,
-    receive_poll_delay_seconds: float,
-) -> None:
-    resolved_path = Path(state_path)
+@dataclass
+class BotConfig:
+    account: str
+    state_path: Path
+    welcome_group: str
+    welcome_message: str
+    welcome_message_min_interval_seconds: int
+    state_max_age_seconds: int
+    sync_on_startup: bool
+    signal_cli_timeout_seconds: float
+    signal_receive_timeout_seconds: int
+    receive_poll_delay_seconds: float
+
+
+class BotState(BaseModel):
+    welcome_group_id: str
+    welcome_group_members: list[str] = Field(default_factory=list)
+    pending_welcome_members: list[str] = Field(default_factory=list)
+    last_welcome_sent_at: float | None = None
+    """
+    list of member ids (uuid or number)
+    """
+
+
+def run_bot(config: BotConfig) -> None:
     try:
-        asyncio.run(
-            _run(
-                account=account,
-                state_path=resolved_path,
-                welcome_group=welcome_group,
-                welcome_message=welcome_message,
-                state_max_age_seconds=state_max_age_seconds,
-                sync_on_startup=sync_on_startup,
-                signal_cli_timeout_seconds=signal_cli_timeout_seconds,
-                signal_receive_timeout_seconds=signal_receive_timeout_seconds,
-                receive_poll_delay_seconds=receive_poll_delay_seconds,
-            )
-        )
+        asyncio.run(_run(config))
     except KeyboardInterrupt:
         pass
 
 
-async def _run(
-    account: str,
-    state_path: Path,
-    welcome_group: str,
-    welcome_message: str,
-    state_max_age_seconds: int,
-    sync_on_startup: bool,
-    signal_cli_timeout_seconds: float,
-    signal_receive_timeout_seconds: int,
-    receive_poll_delay_seconds: float,
-) -> None:
-    logger.info("Starting signal bot for account {}", account)
+async def _run(config: BotConfig) -> None:
+    logger.info("Starting signal bot for account {}", config.account)
 
     client = SignalCliClient(
-        account,
-        command_timeout_seconds=signal_cli_timeout_seconds,
-        receive_timeout_seconds=signal_receive_timeout_seconds,
+        config.account,
+        command_timeout_seconds=config.signal_cli_timeout_seconds,
+        receive_timeout_seconds=config.signal_receive_timeout_seconds,
     )
-    if sync_on_startup:
+    if config.sync_on_startup:
         logger.info("Requesting Signal sync on startup")
         await client.send_sync_request()
 
-    state = _load_state(state_path, state_max_age_seconds)
+    state = _load_state(config.state_path, config.state_max_age_seconds)
     if state:
-        logger.info(f"Bot state loaded from: {state_path}")
+        logger.info(f"Bot state loaded from: {config.state_path}")
     if not state:
         logger.info("No bot state found, seeding")
-        state = await _seed_state(client, welcome_group)
-        _save_state(state, state_path)
+        state = await _seed_state(client, config.welcome_group)
+        _save_state(state, config.state_path)
         logger.info("Bot state seeded")
 
     while True:
@@ -80,23 +72,26 @@ async def _run(
                     await _greet_new_welcome_group_members(
                         client,
                         state,
-                        state_path,
-                        welcome_message,
+                        config.state_path,
+                        config.welcome_message,
+                        config.welcome_message_min_interval_seconds,
                     )
                 except RuntimeError as exc:
                     logger.error("Error handling group update: {}", exc)
-        if receive_poll_delay_seconds > 0:
+        try:
+            await _flush_pending_welcome_messages(
+                client,
+                state,
+                config.state_path,
+                config.welcome_message,
+                config.welcome_message_min_interval_seconds,
+            )
+        except RuntimeError as exc:
+            logger.error("Error flushing pending welcomes: {}", exc)
+        if config.receive_poll_delay_seconds > 0:
             logger.debug("sleep")
-            await asyncio.sleep(receive_poll_delay_seconds)
+            await asyncio.sleep(config.receive_poll_delay_seconds)
             logger.debug("receive")
-
-
-class BotState(BaseModel):
-    welcome_group_id: str
-    welcome_group_members: list[str] = Field(default_factory=list)
-    """
-    list of member ids (uuid or number)
-    """
 
 
 async def _seed_state(client: SignalCliClient, welcome_group: str) -> BotState:
@@ -115,6 +110,8 @@ async def _seed_state(client: SignalCliClient, welcome_group: str) -> BotState:
     return BotState(
         welcome_group_id=group.resolved_id,
         welcome_group_members=sorted(group.get_member_ids()),
+        pending_welcome_members=[],
+        last_welcome_sent_at=None,
     )
 
 
@@ -130,6 +127,7 @@ async def _greet_new_welcome_group_members(
     state: BotState,
     state_path: Path,
     welcome_message: str,
+    welcome_message_min_interval_seconds: int,
 ) -> None:
     # Get group info
     group_id = state.welcome_group_id
@@ -148,17 +146,22 @@ async def _greet_new_welcome_group_members(
 
     new_members = members - known_members
     removed_members = known_members - members
+    pending_members = {str(member_id) for member_id in state.pending_welcome_members}
     logger.debug(
-        "Group {} membership diff: known={}, current={}, new={}, removed={}",
+        "Group {} membership diff: known={}, current={}, new={}, removed={}, pending={}",
         group_id,
         len(known_members),
         len(members),
         len(new_members),
         len(removed_members),
+        len(pending_members),
     )
-    contacts = await client.list_contacts()
-    contacts_by_id = _contacts_by_id(contacts)
+    contacts_by_id: dict[str, ContactRecipient] = {}
     if removed_members:
+        contacts = await client.list_contacts()
+        contacts_by_id = _contacts_by_id(contacts)
+    if removed_members:
+        pending_members -= removed_members
         removed_member_names = [
             _render_member_name_by_id(member_id, contacts_by_id)
             for member_id in sorted(removed_members)
@@ -168,24 +171,25 @@ async def _greet_new_welcome_group_members(
             group_id,
             _render_welcome_targets(removed_member_names, len(removed_members)),
         )
-    if not new_members:
-        state.welcome_group_members = sorted(members)
-        _save_state(state, state_path)
-        return
-
-    # Greet new members
-    group_members = await client.group_members(group_id)
-    new_member_names = [
-        _render_member_name(member, contacts_by_id)
-        for member in group_members
-        if (member.uuid or member.number) in new_members
-    ]
-    rendered_names = _render_welcome_targets(new_member_names, len(new_members))
-    message = welcome_message.replace("{{newusers}}", rendered_names)
-    await client.send_group_message(group_id, message)
-    logger.info("Sent welcome message to group {}", group_id)
+    if new_members:
+        pending_members |= new_members
+        logger.info(
+            "Queued {} new welcome member(s) for group {}",
+            len(new_members),
+            group_id,
+        )
     state.welcome_group_members = sorted(members)
+    state.pending_welcome_members = sorted(pending_members)
     _save_state(state, state_path)
+    if not new_members and not removed_members:
+        return
+    await _flush_pending_welcome_messages(
+        client,
+        state,
+        state_path,
+        welcome_message,
+        welcome_message_min_interval_seconds,
+    )
 
 
 def _save_state(state: BotState, state_path: Path) -> None:
@@ -195,6 +199,10 @@ def _save_state(state: BotState, state_path: Path) -> None:
         welcome_group_members=sorted(
             {str(member) for member in state.welcome_group_members}
         ),
+        pending_welcome_members=sorted(
+            {str(member) for member in state.pending_welcome_members}
+        ),
+        last_welcome_sent_at=state.last_welcome_sent_at,
     )
     state_path.write_text(encoded.model_dump_json(indent=2))
 
@@ -211,6 +219,92 @@ def _load_state(
         return None
 
     return BotState.model_validate_json(state_path.read_text())
+
+
+async def _flush_pending_welcome_messages(
+    client: SignalCliClient,
+    state: BotState,
+    state_path: Path,
+    welcome_message: str,
+    welcome_message_min_interval_seconds: int,
+) -> None:
+    pending_members = {str(member_id) for member_id in state.pending_welcome_members}
+    if not pending_members:
+        return
+
+    now = time.time()
+    if not _can_send_welcome_message(
+        state.last_welcome_sent_at,
+        now,
+        welcome_message_min_interval_seconds,
+    ):
+        if state.last_welcome_sent_at:
+            duration_till_welcome_msg = welcome_message_min_interval_seconds - (
+                now - state.last_welcome_sent_at
+            )
+            logger.debug(
+                f"{len(pending_members)} pending members queued for another {duration_till_welcome_msg:.0f} seconds"
+            )
+        return
+
+    # Check that the pending members are still part of the group
+    group = await client.get_group_by_id(state.welcome_group_id)
+    if group is None:
+        logger.error("Could not resolve group info for pending welcomes!")
+        return
+
+    current_member_ids = group.get_member_ids()
+    pending_members &= current_member_ids
+    state.welcome_group_members = sorted(current_member_ids)
+    if not pending_members:
+        state.pending_welcome_members = []
+        _save_state(state, state_path)
+        return
+
+    # Resolve names of pending members
+    contacts_by_id = _contacts_by_id(await client.list_contacts())
+    group_members = await client.group_members(state.welcome_group_id)
+    pending_member_names = [
+        _render_member_name(member, contacts_by_id)
+        for member in group_members
+        if (member.uuid or member.number) in pending_members
+    ]
+    rendered_names = _render_welcome_targets(
+        pending_member_names,
+        len(pending_members),
+    )
+
+    # Send welcome message
+    message = welcome_message.replace("{{newusers}}", rendered_names)
+    await client.send_group_message(state.welcome_group_id, message)
+    state.pending_welcome_members = []
+    state.last_welcome_sent_at = now
+    _save_state(state, state_path)
+    logger.info(
+        "Sent welcome message to group {} for {} member(s)",
+        state.welcome_group_id,
+        len(pending_members),
+    )
+
+
+def _can_send_welcome_message(
+    last_welcome_sent_at: float | None,
+    now: float,
+    welcome_message_min_interval_seconds: int,
+) -> bool:
+    """
+    Check whether the welcome cooldown has elapsed.
+
+    Args:
+    - last_welcome_sent_at - unix timestamp of the last sent welcome message
+    - now - current unix timestamp
+    - welcome_message_min_interval_seconds - minimum interval between sent welcomes
+
+    Returns: True when a welcome message may be sent now
+    """
+    if last_welcome_sent_at is None:
+        return True
+    return now - last_welcome_sent_at >= welcome_message_min_interval_seconds
 
 
 def _contacts_by_id(contacts: list[ContactRecipient]) -> dict[str, ContactRecipient]:
