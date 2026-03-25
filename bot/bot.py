@@ -9,7 +9,13 @@ import re
 from loguru import logger
 from pydantic import BaseModel, Field
 
-from bot.signal_cli import ContactRecipient, GroupMember, SignalCliClient, SignalPayload
+from bot.signal_cli import (
+    ContactRecipient,
+    GroupMember,
+    SignalClient,
+    SignalPayload,
+    create_signal_client,
+)
 
 
 @dataclass
@@ -21,9 +27,11 @@ class BotConfig:
     welcome_message_min_interval_seconds: int
     state_max_age_seconds: int
     sync_on_startup: bool
+    signal_client_mode: str
     signal_cli_timeout_seconds: float
     signal_receive_timeout_seconds: int
     receive_poll_delay_seconds: float
+    signal_daemon_socket_path: Path | None
 
 
 class BotState(BaseModel):
@@ -46,10 +54,12 @@ def run_bot(config: BotConfig) -> None:
 async def _run(config: BotConfig) -> None:
     logger.info("Starting signal bot for account {}", config.account)
 
-    client = SignalCliClient(
-        config.account,
+    client = create_signal_client(
+        mode=config.signal_client_mode,
+        account=config.account,
         command_timeout_seconds=config.signal_cli_timeout_seconds,
         receive_timeout_seconds=config.signal_receive_timeout_seconds,
+        daemon_socket_path=config.signal_daemon_socket_path,
     )
     if config.sync_on_startup:
         logger.info("Requesting Signal sync on startup")
@@ -94,7 +104,7 @@ async def _run(config: BotConfig) -> None:
             logger.debug("receive")
 
 
-async def _seed_state(client: SignalCliClient, welcome_group: str) -> BotState:
+async def _seed_state(client: SignalClient, welcome_group: str) -> BotState:
     group = await client.get_group_by_name(welcome_group)
 
     if group is None:
@@ -123,7 +133,7 @@ def is_welcome_group_update(payload: SignalPayload, state: BotState) -> bool:
 
 
 async def _greet_new_welcome_group_members(
-    client: SignalCliClient,
+    client: SignalClient,
     state: BotState,
     state_path: Path,
     welcome_message: str,
@@ -222,7 +232,7 @@ def _load_state(
 
 
 async def _flush_pending_welcome_messages(
-    client: SignalCliClient,
+    client: SignalClient,
     state: BotState,
     state_path: Path,
     welcome_message: str,

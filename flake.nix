@@ -17,6 +17,8 @@
       repoDir = "/srv/veganactivistsnl-bot";
       venvDir = "${repoDir}/.venv";
       tmpDir = "${repoDir}/tmp";
+      runDir = "${repoDir}/run";
+      signalSocketPath = "${runDir}/signal-cli.sock";
 
       runtimePkgs = [
         pkgs.bash
@@ -53,6 +55,26 @@
         '';
       };
 
+      runSignalDaemon = pkgs.writeShellApplication {
+        name = "signal-daemon-run";
+        runtimeInputs = runtimePkgs;
+        text = ''
+          set -euo pipefail
+          cd "${repoDir}"
+
+          if [ -z "''${SIGNAL_ACCOUNT:-}" ]; then
+            echo "SIGNAL_ACCOUNT must be set in ${repoDir}/.env" >&2
+            exit 1
+          fi
+
+          mkdir -p "${tmpDir}" "${runDir}"
+          export TMPDIR="${tmpDir}"
+          rm -f "${signalSocketPath}"
+
+          exec signal-cli -u "$SIGNAL_ACCOUNT" daemon --socket "${signalSocketPath}" --receive-mode on-connection
+        '';
+      };
+
       pollOnce = pkgs.writeShellApplication {
         name = "bot-poll-once";
         runtimeInputs = runtimePkgs ++ [pkgs.systemd pkgs.nix];
@@ -76,15 +98,18 @@
           echo "Updating: $localRev -> $remoteRev"
           git reset --hard "$REMOTE/$BRANCH"
 
-          # Restart the service; the service ExecStart will (re)install pip deps
+          # Restart the daemon and bot so both pick up code/config changes.
+          systemctl restart signal-cli-daemon.service
           systemctl restart bot.service
-          echo "Restarted bot.service"
+          echo "Restarted signal-cli-daemon.service and bot.service"
         '';
       };
 
       serviceUnit = pkgs.writeText "bot.service" ''
         [Unit]
         Description=Signal bot (Nix runtime + pip venv)
+        Requires=signal-cli-daemon.service
+        After=signal-cli-daemon.service
         After=network-online.target
         Wants=network-online.target
 
@@ -95,6 +120,32 @@
 
         # Your bot gets signal-cli + python from Nix, deps from venv
         ExecStart=${runBot}/bin/bot-run
+
+        Restart=always
+        RestartSec=2
+        StandardOutput=journal
+        StandardError=journal
+
+        Environment=SIGNAL_CLIENT_MODE=daemon
+        Environment=SIGNAL_DAEMON_SOCKET_PATH=${signalSocketPath}
+        Environment=TMPDIR=${tmpDir}
+        EnvironmentFile=${repoDir}/.env
+
+        [Install]
+        WantedBy=multi-user.target
+      '';
+
+      daemonServiceUnit = pkgs.writeText "signal-cli-daemon.service" ''
+        [Unit]
+        Description=signal-cli daemon (JSON-RPC over Unix socket)
+        After=network-online.target
+        Wants=network-online.target
+
+        [Service]
+        Type=simple
+        User=ubuntu
+        WorkingDirectory=${repoDir}
+        ExecStart=${runSignalDaemon}/bin/signal-daemon-run
 
         Restart=always
         RestartSec=2
@@ -143,17 +194,21 @@
           trap 'rm -rf "$temp_dir"' EXIT
 
           sed "s/^User=.*/User=$bot_user/" ${serviceUnit} > "$temp_dir/bot.service"
+          sed "s/^User=.*/User=$bot_user/" ${daemonServiceUnit} > "$temp_dir/signal-cli-daemon.service"
           sed "s/^User=.*/User=$bot_user/" ${pollServiceUnit} > "$temp_dir/bot-poll.service"
 
           sudo install -m 0644 "$temp_dir/bot.service" /etc/systemd/system/bot.service
+          sudo install -m 0644 "$temp_dir/signal-cli-daemon.service" /etc/systemd/system/signal-cli-daemon.service
           sudo install -m 0644 "$temp_dir/bot-poll.service" /etc/systemd/system/bot-poll.service
           sudo install -m 0644 ${pollTimerUnit} /etc/systemd/system/bot-poll.timer
 
           sudo systemctl daemon-reload
+          sudo systemctl enable --now signal-cli-daemon.service
           sudo systemctl enable --now bot.service
           sudo systemctl enable --now bot-poll.timer
 
           echo "Installed and started:"
+          echo " - signal-cli-daemon.service"
           echo " - bot.service"
           echo " - bot-poll.timer"
           echo " - user: $bot_user"

@@ -1,6 +1,9 @@
+import abc
 import asyncio
 import json
+import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable
 
 from loguru import logger
@@ -145,7 +148,7 @@ class SignalCliError(RuntimeError):
         self.result = result
 
 
-class SignalCliClient:
+class SignalClient(abc.ABC):
     def __init__(
         self,
         account: str,
@@ -156,8 +159,56 @@ class SignalCliClient:
         self.command_timeout_seconds = command_timeout_seconds
         self.receive_timeout_seconds = receive_timeout_seconds
 
+    @abc.abstractmethod
+    async def list_groups(self, group_id: str | None = None) -> list[SignalGroup]:
+        raise NotImplementedError
+
+    async def get_group_by_id(self, group_id: str) -> SignalGroup | None:
+        all_groups = await self.list_groups()
+        return next((g for g in all_groups if g.resolved_id == group_id), None)
+
+    async def get_group_by_name(self, group_name: str) -> SignalGroup | None:
+        all_groups = await self.list_groups()
+        return next((g for g in all_groups if g.name == group_name), None)
+
+    @abc.abstractmethod
+    async def list_contacts(self) -> list[ContactRecipient]:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    async def send_group_message(self, group_id: str, message: str) -> None:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    async def send_sync_request(self) -> None:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    async def receive_events(self) -> list[SignalPayload]:
+        raise NotImplementedError
+
+    async def group_members(self, group_id: str) -> list[GroupMember]:
+        groups = await self.list_groups()
+        for group in groups:
+            if group.resolved_id == group_id:
+                return group.members
+        return []
+
+    async def group_member_keys(self, group_id: str) -> list[str]:
+        members = await self.group_members(group_id)
+        keys: list[str] = []
+        for member in members:
+            if member.uuid:
+                keys.append(member.uuid)
+            elif member.number:
+                keys.append(member.number)
+        return keys
+
+
+class SignalCliClient(SignalClient):
     async def _run(self, *args: str, check: bool = True) -> CommandResult:
         logger.debug("signal-cli exec: {}", " ".join(args))
+        started_at = time.monotonic()
         proc = await asyncio.create_subprocess_exec(
             *args,
             stdout=asyncio.subprocess.PIPE,
@@ -180,15 +231,16 @@ class SignalCliClient:
                 message,
                 CommandResult(stdout="", stderr=message, returncode=-1),
             ) from exc
+        elapsed = time.monotonic() - started_at
         result = CommandResult(
             stdout=stdout.decode("utf-8", errors="replace"),
             stderr=stderr.decode("utf-8", errors="replace"),
             returncode=proc.returncode or 0,
         )
         if check and result.returncode != 0:
-            logger.debug("signal-cli error: {}", result.stderr.strip())
+            logger.debug("signal-cli error ({}s): {}", f"{elapsed:.2f}", result.stderr.strip())
             raise SignalCliError(result.stderr.strip(), result)
-        logger.debug("signal-cli ok: {}", result.stdout.strip())
+        logger.debug("signal-cli ok ({}s): {}", f"{elapsed:.2f}", result.stdout.strip())
         return result
 
     async def _run_json(self, *args: str) -> object:
@@ -199,34 +251,18 @@ class SignalCliClient:
         base_command = ["signal-cli", "-u", self.account, "-o", "json", "listGroups"]
         if group_id:
             base_command.extend(["-g", group_id])
-        commands = [base_command]
-        last_error: Exception | None = None
-        for cmd in commands:
-            try:
-                data = await self._run_json(*cmd)
-            except (SignalCliError, json.JSONDecodeError) as exc:
-                last_error = exc
-                continue
-            if isinstance(data, list):
-                return [
-                    SignalGroup.model_validate(item)
-                    for item in data
-                    if isinstance(item, dict)
-                ]
-            if isinstance(data, dict):
-                parsed = GroupList.model_validate(data)
-                return parsed.groups
-        if last_error:
-            raise last_error
-        return []
-
-    async def get_group_by_id(self, group_id: str) -> SignalGroup | None:
-        all_groups = await self.list_groups()
-        return next((g for g in all_groups if g.resolved_id == group_id), None)
-
-    async def get_group_by_name(self, group_name: str) -> SignalGroup | None:
-        all_groups = await self.list_groups()
-        return next((g for g in all_groups if g.name == group_name), None)
+        data = await self._run_json(*base_command)
+        if isinstance(data, list):
+            groups = [
+                SignalGroup.model_validate(item) for item in data if isinstance(item, dict)
+            ]
+        elif isinstance(data, dict):
+            groups = GroupList.model_validate(data).groups
+        else:
+            groups = []
+        if group_id:
+            return [group for group in groups if group.resolved_id == group_id]
+        return groups
 
     async def list_contacts(self) -> list[ContactRecipient]:
         data = await self._run_json(
@@ -289,18 +325,7 @@ class SignalCliClient:
                     returncode=proc.returncode,
                 ),
             )
-        events: list[SignalPayload] = []
-        for line in stdout.decode("utf-8", errors="replace").splitlines():
-            if not line.strip():
-                continue
-            try:
-                payload = SignalPayload.model_validate_json(line)
-            except ValueError as exc:
-                logger.debug("signal-cli payload parse error: {}", exc)
-                continue
-            logger.debug("signal-cli event type: {}", payload.describe_event())
-            events.append(payload)
-        return events
+        return _parse_signal_payload_lines(stdout.decode("utf-8", errors="replace"))
 
     @staticmethod
     def _log_output(prefix: str, text: str) -> None:
@@ -309,22 +334,244 @@ class SignalCliClient:
             if rendered:
                 logger.debug("{}{}", prefix, rendered)
 
-    async def group_members(self, group_id: str) -> list[GroupMember]:
-        groups = await self.list_groups()
-        for group in groups:
-            if group.resolved_id == group_id:
-                return group.members
-        return []
 
-    async def group_member_keys(self, group_id: str) -> list[str]:
-        members = await self.group_members(group_id)
-        keys: list[str] = []
-        for member in members:
-            if member.uuid:
-                keys.append(member.uuid)
-            elif member.number:
-                keys.append(member.number)
-        return keys
+class SignalRpcClient(SignalClient):
+    def __init__(
+        self,
+        account: str,
+        socket_path: Path,
+        command_timeout_seconds: float = 30.0,
+        receive_timeout_seconds: int = 5,
+    ) -> None:
+        super().__init__(account, command_timeout_seconds, receive_timeout_seconds)
+        self.socket_path = socket_path
+        self._reader: asyncio.StreamReader | None = None
+        self._writer: asyncio.StreamWriter | None = None
+        self._read_task: asyncio.Task[None] | None = None
+        self._write_lock = asyncio.Lock()
+        self._request_id = 0
+        self._pending: dict[str, asyncio.Future[object]] = {}
+        self._event_queue: asyncio.Queue[SignalPayload] = asyncio.Queue()
+
+    async def list_groups(self, group_id: str | None = None) -> list[SignalGroup]:
+        data = await self._request("listGroups")
+        groups = _parse_groups_from_object(data)
+        if group_id:
+            return [group for group in groups if group.resolved_id == group_id]
+        return groups
+
+    async def list_contacts(self) -> list[ContactRecipient]:
+        data = await self._request("listContacts")
+        if not isinstance(data, list):
+            return []
+        return [
+            ContactRecipient.model_validate(item) for item in data if isinstance(item, dict)
+        ]
+
+    async def send_group_message(self, group_id: str, message: str) -> None:
+        await self._request(
+            "send",
+            {
+                "message": message,
+                "groupId": group_id,
+            },
+        )
+
+    async def send_sync_request(self) -> None:
+        await self._request("sendSyncRequest")
+
+    async def receive_events(self) -> list[SignalPayload]:
+        events: list[SignalPayload] = []
+        try:
+            first_event = await asyncio.wait_for(
+                self._event_queue.get(),
+                timeout=self.receive_timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            return []
+        events.append(first_event)
+        while True:
+            try:
+                events.append(self._event_queue.get_nowait())
+            except asyncio.QueueEmpty:
+                return events
+
+    async def _ensure_connected(self) -> None:
+        if self._writer is not None and not self._writer.is_closing():
+            return
+        reader, writer = await asyncio.open_unix_connection(str(self.socket_path))
+        self._reader = reader
+        self._writer = writer
+        self._read_task = asyncio.create_task(self._read_loop())
+
+    async def _request(self, method: str, params: dict[str, object] | None = None) -> object:
+        await self._ensure_connected()
+        assert self._writer is not None
+        self._request_id += 1
+        request_id = str(self._request_id)
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[object] = loop.create_future()
+        self._pending[request_id] = future
+        rpc_message: dict[str, object] = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+        }
+        if params:
+            rpc_message["params"] = params
+        encoded = json.dumps(rpc_message) + "\n"
+        logger.debug("signal-cli rpc -> {} {}", method, params or {})
+        started_at = time.monotonic()
+        async with self._write_lock:
+            self._writer.write(encoded.encode("utf-8"))
+            await self._writer.drain()
+        try:
+            result = await asyncio.wait_for(
+                future,
+                timeout=self.command_timeout_seconds,
+            )
+        except asyncio.TimeoutError as exc:
+            self._pending.pop(request_id, None)
+            timeout_message = (
+                f"signal-cli rpc timed out after {self.command_timeout_seconds:.1f}s: "
+                f"{method}"
+            )
+            raise SignalCliError(
+                timeout_message,
+                CommandResult(stdout="", stderr=timeout_message, returncode=-1),
+            ) from exc
+        elapsed = time.monotonic() - started_at
+        logger.debug("signal-cli rpc <- {} ({}s)", method, f"{elapsed:.2f}")
+        return result
+
+    async def _read_loop(self) -> None:
+        assert self._reader is not None
+        try:
+            while True:
+                line = await self._reader.readline()
+                if not line:
+                    raise SignalCliError(
+                        "signal-cli rpc socket closed",
+                        CommandResult(stdout="", stderr="socket closed", returncode=-1),
+                    )
+                self._handle_message(line.decode("utf-8", errors="replace").strip())
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._fail_pending(str(exc))
+            raise
+
+    def _handle_message(self, line: str) -> None:
+        if not line:
+            return
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError as exc:
+            logger.debug("signal-cli rpc parse error: {}", exc)
+            return
+        if not isinstance(message, dict):
+            return
+        if "id" in message:
+            request_id = str(message["id"])
+            future = self._pending.pop(request_id, None)
+            if future is None or future.done():
+                return
+            error = message.get("error")
+            if isinstance(error, dict):
+                error_message = str(error.get("message") or "signal-cli rpc error")
+                future.set_exception(
+                    SignalCliError(
+                        error_message,
+                        CommandResult(stdout="", stderr=error_message, returncode=-1),
+                    )
+                )
+                return
+            future.set_result(message.get("result"))
+            return
+        method = message.get("method")
+        params = message.get("params")
+        if method != "receive" or not isinstance(params, dict):
+            logger.debug("signal-cli rpc notification: {}", message)
+            return
+        try:
+            payload = SignalPayload.model_validate(params)
+        except ValueError as exc:
+            logger.debug("signal-cli rpc payload parse error: {}", exc)
+            return
+        logger.debug("signal-cli event type: {}", payload.describe_event())
+        self._event_queue.put_nowait(payload)
+
+    def _fail_pending(self, message: str) -> None:
+        error = SignalCliError(
+            message,
+            CommandResult(stdout="", stderr=message, returncode=-1),
+        )
+        for future in self._pending.values():
+            if not future.done():
+                future.set_exception(error)
+        self._pending.clear()
+
+
+def create_signal_client(
+    mode: str,
+    account: str,
+    command_timeout_seconds: float,
+    receive_timeout_seconds: int,
+    daemon_socket_path: Path | None = None,
+) -> SignalClient:
+    """
+    Create a Signal client for the configured transport mode.
+
+    Args:
+    - mode - transport mode, either "cli" or "daemon"
+    - account - Signal account number
+    - command_timeout_seconds - timeout for request/command round-trips
+    - receive_timeout_seconds - timeout when waiting for new events
+    - daemon_socket_path - Unix socket path for daemon mode
+
+    Returns: configured Signal client
+    """
+    normalized_mode = mode.strip().lower()
+    if normalized_mode == "cli":
+        return SignalCliClient(
+            account,
+            command_timeout_seconds=command_timeout_seconds,
+            receive_timeout_seconds=receive_timeout_seconds,
+        )
+    if normalized_mode == "daemon":
+        if daemon_socket_path is None:
+            raise ValueError("daemon socket path is required for daemon mode")
+        return SignalRpcClient(
+            account,
+            socket_path=daemon_socket_path,
+            command_timeout_seconds=command_timeout_seconds,
+            receive_timeout_seconds=receive_timeout_seconds,
+        )
+    raise ValueError(f"Unsupported signal client mode: {mode}")
+
+
+def _parse_groups_from_object(data: object) -> list[SignalGroup]:
+    if isinstance(data, list):
+        return [SignalGroup.model_validate(item) for item in data if isinstance(item, dict)]
+    if isinstance(data, dict):
+        return GroupList.model_validate(data).groups
+    return []
+
+
+def _parse_signal_payload_lines(text: str) -> list[SignalPayload]:
+    events: list[SignalPayload] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            payload = SignalPayload.model_validate_json(line)
+        except ValueError as exc:
+            logger.debug("signal-cli payload parse error: {}", exc)
+            continue
+        logger.debug("signal-cli event type: {}", payload.describe_event())
+        events.append(payload)
+    return events
+
 
 def normalize_member_set(members: Iterable[GroupMember]) -> set[str]:
     result = set()

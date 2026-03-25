@@ -21,9 +21,11 @@ DEFAULT_WELCOME_MESSAGE = (
 DEFAULT_WELCOME_GROUP = "Intro - Vegan Activists NL"
 DEFAULT_WELCOME_MESSAGE_MIN_INTERVAL_SECONDS = 90
 DEFAULT_SYNC_ON_STARTUP = True
+DEFAULT_SIGNAL_CLIENT_MODE = "daemon"
 DEFAULT_SIGNAL_CLI_TIMEOUT_SECONDS = 30.0
 DEFAULT_SIGNAL_RECEIVE_TIMEOUT_SECONDS = 2
 DEFAULT_RECEIVE_POLL_DELAY_SECONDS = 0.2
+DEFAULT_SIGNAL_DAEMON_SOCKET_PATH = "/srv/veganactivistsnl-bot/run/signal-cli.sock"
 
 
 def main() -> None:
@@ -48,6 +50,8 @@ def main() -> None:
         raise ValueError("--signal-receive-timeout-seconds must be greater than zero")
     if args.receive_poll_delay_seconds < 0:
         raise ValueError("--receive-poll-delay-seconds must be zero or greater")
+    if args.signal_client_mode not in {"cli", "daemon"}:
+        raise ValueError("--signal-client-mode must be either 'cli' or 'daemon'")
     config = BotConfig(
         account=args.account,
         state_path=args.state_path,
@@ -56,9 +60,11 @@ def main() -> None:
         welcome_message_min_interval_seconds=args.welcome_message_min_interval_seconds,
         state_max_age_seconds=args.state_max_age_seconds,
         sync_on_startup=args.sync_on_startup,
+        signal_client_mode=args.signal_client_mode,
         signal_cli_timeout_seconds=args.signal_cli_timeout_seconds,
         signal_receive_timeout_seconds=args.signal_receive_timeout_seconds,
         receive_poll_delay_seconds=args.receive_poll_delay_seconds,
+        signal_daemon_socket_path=args.signal_daemon_socket_path,
     )
     run_bot(config)
 
@@ -127,6 +133,12 @@ def _parse_args() -> argparse.Namespace:
         help="Send a Signal sync request on startup (or set SIGNAL_SYNC_ON_STARTUP)",
     )
     parser.add_argument(
+        "--signal-client-mode",
+        default=os.environ.get("SIGNAL_CLIENT_MODE", DEFAULT_SIGNAL_CLIENT_MODE),
+        choices=["cli", "daemon"],
+        help="Signal transport mode: cli or daemon (or set SIGNAL_CLIENT_MODE)",
+    )
+    parser.add_argument(
         "--signal-cli-timeout-seconds",
         type=float,
         default=float(
@@ -166,6 +178,20 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Delay between receive polling cycles in seconds "
             "(or set RECEIVE_POLL_DELAY_SECONDS)"
+        ),
+    )
+    parser.add_argument(
+        "--signal-daemon-socket-path",
+        type=Path,
+        default=Path(
+            os.environ.get(
+                "SIGNAL_DAEMON_SOCKET_PATH",
+                DEFAULT_SIGNAL_DAEMON_SOCKET_PATH,
+            )
+        ),
+        help=(
+            "Unix socket path for signal-cli daemon mode "
+            "(or set SIGNAL_DAEMON_SOCKET_PATH)"
         ),
     )
     return parser.parse_args()
