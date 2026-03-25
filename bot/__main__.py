@@ -12,7 +12,8 @@ DEFAULT_WELCOME_MESSAGE = "Welcome {{newusers}} to the group!"
 DEFAULT_WELCOME_GROUP = "Intro - Vegan Activists NL"
 DEFAULT_SYNC_ON_STARTUP = True
 DEFAULT_SIGNAL_CLI_TIMEOUT_SECONDS = 30.0
-DEFAULT_SIGNAL_RECEIVE_TIMEOUT_SECONDS = 5
+DEFAULT_SIGNAL_RECEIVE_TIMEOUT_SECONDS = 1
+DEFAULT_RECEIVE_POLL_DELAY_SECONDS = 0.2
 
 
 def main() -> None:
@@ -31,6 +32,8 @@ def main() -> None:
         raise ValueError("--signal-cli-timeout-seconds must be greater than zero")
     if args.signal_receive_timeout_seconds <= 0:
         raise ValueError("--signal-receive-timeout-seconds must be greater than zero")
+    if args.receive_poll_delay_seconds < 0:
+        raise ValueError("--receive-poll-delay-seconds must be zero or greater")
     run_bot(
         account=args.account,
         state_path=args.state_path,
@@ -40,6 +43,7 @@ def main() -> None:
         sync_on_startup=args.sync_on_startup,
         signal_cli_timeout_seconds=args.signal_cli_timeout_seconds,
         signal_receive_timeout_seconds=args.signal_receive_timeout_seconds,
+        receive_poll_delay_seconds=args.receive_poll_delay_seconds,
     )
 
 
@@ -118,6 +122,20 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Timeout for each receive polling cycle in seconds "
             "(or set SIGNAL_RECEIVE_TIMEOUT_SECONDS)"
+        ),
+    )
+    parser.add_argument(
+        "--receive-poll-delay-seconds",
+        type=float,
+        default=float(
+            os.environ.get(
+                "RECEIVE_POLL_DELAY_SECONDS",
+                DEFAULT_RECEIVE_POLL_DELAY_SECONDS,
+            )
+        ),
+        help=(
+            "Delay between receive polling cycles in seconds "
+            "(or set RECEIVE_POLL_DELAY_SECONDS)"
         ),
     )
     return parser.parse_args()

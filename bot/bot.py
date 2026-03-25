@@ -20,6 +20,7 @@ def run_bot(
     sync_on_startup: bool,
     signal_cli_timeout_seconds: float,
     signal_receive_timeout_seconds: int,
+    receive_poll_delay_seconds: float,
 ) -> None:
     resolved_path = Path(state_path)
     try:
@@ -33,6 +34,7 @@ def run_bot(
                 sync_on_startup=sync_on_startup,
                 signal_cli_timeout_seconds=signal_cli_timeout_seconds,
                 signal_receive_timeout_seconds=signal_receive_timeout_seconds,
+                receive_poll_delay_seconds=receive_poll_delay_seconds,
             )
         )
     except KeyboardInterrupt:
@@ -48,6 +50,7 @@ async def _run(
     sync_on_startup: bool,
     signal_cli_timeout_seconds: float,
     signal_receive_timeout_seconds: int,
+    receive_poll_delay_seconds: float,
 ) -> None:
     logger.info("Starting signal bot for account {}", account)
 
@@ -82,9 +85,10 @@ async def _run(
                     )
                 except RuntimeError as exc:
                     logger.error("Error handling group update: {}", exc)
-        logger.debug("sleep")
-        await asyncio.sleep(2)
-        logger.debug("receive")
+        if receive_poll_delay_seconds > 0:
+            logger.debug("sleep")
+            await asyncio.sleep(receive_poll_delay_seconds)
+            logger.debug("receive")
 
 
 class BotState(BaseModel):
@@ -144,6 +148,14 @@ async def _greet_new_welcome_group_members(
 
     new_members = members - known_members
     removed_members = known_members - members
+    logger.debug(
+        "Group {} membership diff: known={}, current={}, new={}, removed={}",
+        group_id,
+        len(known_members),
+        len(members),
+        len(new_members),
+        len(removed_members),
+    )
     contacts = await client.list_contacts()
     contacts_by_id = _contacts_by_id(contacts)
     if removed_members:
