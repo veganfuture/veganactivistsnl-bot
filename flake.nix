@@ -37,6 +37,7 @@
           fi
 
           # Activate venv
+          # shellcheck disable=SC1091
           source "${venvDir}/bin/activate"
 
           # Install deps (fast when already satisfied)
@@ -166,6 +167,7 @@
           fi
 
           # Activate venv
+          # shellcheck disable=SC1091
           source "$venv_dir/bin/activate"
 
           python -m pip install -U pip wheel setuptools
