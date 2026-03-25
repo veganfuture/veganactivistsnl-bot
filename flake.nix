@@ -75,7 +75,29 @@
           export JAVA_TOOL_OPTIONS="-Djava.io.tmpdir=${tmpDir}"
           rm -f "${signalSocketPath}"
 
-          exec signal-cli -u "$SIGNAL_ACCOUNT" daemon --socket "${signalSocketPath}" --receive-mode on-connection
+          verbose_args=()
+          if [ -n "''${SIGNAL_DAEMON_VERBOSE:-}" ]; then
+            case "$SIGNAL_DAEMON_VERBOSE" in
+              1|true|yes|y|on)
+                verbose_args=(-v)
+                ;;
+              2)
+                verbose_args=(-vv)
+                ;;
+              *)
+                echo "Invalid SIGNAL_DAEMON_VERBOSE value: $SIGNAL_DAEMON_VERBOSE" >&2
+                echo "Expected one of: 1, 2, true, yes, on" >&2
+                exit 1
+                ;;
+            esac
+          fi
+
+          log_file_args=()
+          if [ -n "''${SIGNAL_DAEMON_LOG_FILE:-}" ]; then
+            log_file_args=(--log-file "$SIGNAL_DAEMON_LOG_FILE")
+          fi
+
+          exec signal-cli "''${verbose_args[@]}" "''${log_file_args[@]}" -u "$SIGNAL_ACCOUNT" daemon --socket "${signalSocketPath}" --receive-mode on-connection
         '';
       };
 
