@@ -184,22 +184,27 @@ async def _greet_new_welcome_group_members(
         )
     if new_members:
         pending_members |= new_members
-        logger.info(
-            "Queued {} new welcome member(s) for group {}",
-            len(new_members),
-            group_id,
-        )
     state.welcome_group_members = sorted(members)
     state.pending_welcome_members = sorted(pending_members)
     _save_state(state, state_path)
-    if not new_members and not removed_members:
+
+    if not new_members:
         return
-    await _flush_pending_welcome_messages(
-        client,
-        state,
-        state_path,
-        welcome_message,
+
+    now = time.time()
+    duration_till_welcome_msg = _duration_till_welcome_msg(
+        state.last_welcome_sent_at,
+        now,
         welcome_message_min_interval_seconds,
+    )
+    if duration_till_welcome_msg is not None:
+        logger.info(
+            f"{len(pending_members)} pending members queued for another {duration_till_welcome_msg:.0f} seconds"
+        )
+        return
+
+    await _send_welcome_messages(
+        client, state, state_path, welcome_message, pending_members, now
     )
 
 
@@ -244,20 +249,30 @@ async def _flush_pending_welcome_messages(
         return
 
     now = time.time()
-    if not _can_send_welcome_message(
+    duration_till_welcome_msg = _duration_till_welcome_msg(
         state.last_welcome_sent_at,
         now,
         welcome_message_min_interval_seconds,
-    ):
-        if state.last_welcome_sent_at:
-            duration_till_welcome_msg = welcome_message_min_interval_seconds - (
-                now - state.last_welcome_sent_at
-            )
-            logger.debug(
-                f"{len(pending_members)} pending members queued for another {duration_till_welcome_msg:.0f} seconds"
-            )
+    )
+    if duration_till_welcome_msg is not None:
+        logger.debug(
+            f"{len(pending_members)} pending members queued for another {duration_till_welcome_msg:.0f} seconds"
+        )
         return
 
+    await _send_welcome_messages(
+        client, state, state_path, welcome_message, pending_members, now
+    )
+
+
+async def _send_welcome_messages(
+    client: SignalClient,
+    state: BotState,
+    state_path: Path,
+    welcome_message: str,
+    new_members: set[str],
+    now: float,
+) -> None:
     # Check that the pending members are still part of the group
     group = await client.get_group_by_id(state.welcome_group_id)
     if group is None:
@@ -265,9 +280,9 @@ async def _flush_pending_welcome_messages(
         return
 
     current_member_ids = group.get_member_ids()
-    pending_members &= current_member_ids
+    new_members &= current_member_ids
     state.welcome_group_members = sorted(current_member_ids)
-    if not pending_members:
+    if not new_members:
         state.pending_welcome_members = []
         _save_state(state, state_path)
         return
@@ -278,11 +293,11 @@ async def _flush_pending_welcome_messages(
     pending_member_names = [
         _render_member_name(member, contacts_by_id)
         for member in group_members
-        if (member.uuid or member.number) in pending_members
+        if (member.uuid or member.number) in new_members
     ]
     rendered_names = _render_welcome_targets(
         pending_member_names,
-        len(pending_members),
+        len(new_members),
     )
 
     # Send welcome message
@@ -294,28 +309,23 @@ async def _flush_pending_welcome_messages(
     logger.info(
         "Sent welcome message to group {} for {} member(s)",
         state.welcome_group_id,
-        len(pending_members),
+        len(new_members),
     )
 
 
-def _can_send_welcome_message(
+def _duration_till_welcome_msg(
     last_welcome_sent_at: float | None,
     now: float,
     welcome_message_min_interval_seconds: int,
-) -> bool:
-    """
-    Check whether the welcome cooldown has elapsed.
-
-    Args:
-    - last_welcome_sent_at - unix timestamp of the last sent welcome message
-    - now - current unix timestamp
-    - welcome_message_min_interval_seconds - minimum interval between sent welcomes
-
-    Returns: True when a welcome message may be sent now
-    """
+) -> float | None:
     if last_welcome_sent_at is None:
-        return True
-    return now - last_welcome_sent_at >= welcome_message_min_interval_seconds
+        return None
+    duration = max(
+        0, welcome_message_min_interval_seconds - (now - last_welcome_sent_at)
+    )
+    if duration == 0:
+        return None
+    return duration
 
 
 def _contacts_by_id(contacts: list[ContactRecipient]) -> dict[str, ContactRecipient]:
