@@ -42,7 +42,7 @@ requirements.txt
 They are installed into:
 
 ```
-/srv/bot/.venv
+/srv/veganactivistsnl-bot/.venv
 ```
 
 This keeps Python dependencies separate from system packages.
@@ -68,22 +68,7 @@ When a new commit is detected:
 
 These steps are only needed once.
 
-## 1. Create project directory
-
-```
-sudo mkdir -p /srv/bot
-sudo chown -R ubuntu:ubuntu /srv/bot
-```
-
-## 2. Clone the repository
-
-```
-git clone <your-repo-url> /srv/bot
-```
-
----
-
-## 3. Install Nix
+## 1. Install Nix and Git
 
 Install the multi-user version of Nix:
 
@@ -98,14 +83,41 @@ sudo mkdir -p /etc/nix
 echo "experimental-features = nix-command flakes" | sudo tee /etc/nix/nix.conf
 ```
 
+Install Git:
+
+```
+nix profile install nixpkgs#git
+```
+
 ---
+## 2. Create project directory
+
+```
+mkdir /srv/
+sudo chown $(whoami) /srv
+cd /srv
+git clone https://github.com/veganfuture/veganactivistsnl-bot.git
+```
+
+---
+
+## 3. First time link Signal device
+
+```
+cd /srv/veganactivistsnl-bot
+nix develop
+```
+
+Before the bot will work you need to link the new device (the machine you're on) to the Signal bot, see "Link the bot to Signal".
+
+After this try to run the bot manually first, see "Run the bot locally".
 
 ## 4. Install services
 
 Run the flake installer:
 
 ```
-cd /srv/bot
+cd /srv/veganactivistsnl-bot
 nix run .#install
 ```
 
@@ -144,13 +156,19 @@ No manual deployment is required.
 nix run .#run
 ```
 
-### Configure state path
-
-By default the bot stores its JSON state at `data/group_state.json`. Override it with:
+Or first run 
 
 ```
-python -m bot --state-path /srv/bot/data/group_state.json
+nix develop
 ```
+
+and then
+
+```
+SIGNAL_ACCOUNT=+31612345678 python -m bot 
+```
+
+Of course the account phone number needs to match the bot's phone number.
 
 ---
 
@@ -207,20 +225,20 @@ You can configure the bot using a `.env` file.
 Example:
 
 ```
-/srv/bot/.env
+/srv/veganactivistsnl-bot/.env
 ```
 
 Example content:
 
 ```
 SIGNAL_ACCOUNT=+123456789
-BOT_STATE_FILE=/srv/bot/data/group_state.json
+BOT_STATE_FILE=/srv/veganactivistsnl-bot/data/group_state.json
 ```
 
 To enable this, ensure the systemd unit contains:
 
 ```
-EnvironmentFile=/srv/bot/.env
+EnvironmentFile=/srv/veganactivistsnl-bot/.env
 ```
 
 After editing:
@@ -235,7 +253,7 @@ sudo systemctl restart bot.service
 You can also pass configuration via CLI flags (these override environment variables):
 
 ```
-python -m bot --account +123456789 --state-path /srv/bot/data/group_state.json
+python -m bot --account +123456789 --state-path /srv/veganactivistsnl-bot/data/group_state.json
 ```
 
 ---

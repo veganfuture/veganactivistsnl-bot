@@ -14,7 +14,7 @@
     flake-utils.lib.eachDefaultSystem (system: let
       pkgs = import nixpkgs {inherit system;};
 
-      repoDir = "/srv/bot";
+      repoDir = "/srv/veganactivistsnl-bot";
       venvDir = "${repoDir}/.venv";
 
       runtimePkgs = [
