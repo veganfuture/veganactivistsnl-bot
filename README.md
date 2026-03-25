@@ -219,6 +219,12 @@ mkdir -p tmp run
 TMPDIR="$PWD/tmp" signal-cli -u "$SIGNAL_ACCOUNT" daemon --socket "$PWD/run/signal-cli.sock" --receive-mode on-connection
 ```
 
+If you get Java temp-dir errors, force the JVM temp dir explicitly:
+
+```bash
+TMPDIR="$PWD/tmp" JAVA_TOOL_OPTIONS="-Djava.io.tmpdir=$PWD/tmp" signal-cli -u "$SIGNAL_ACCOUNT" daemon --socket "$PWD/run/signal-cli.sock" --receive-mode on-connection
+```
+
 Terminal 2, start the bot:
 
 ```bash

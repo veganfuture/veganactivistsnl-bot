@@ -37,6 +37,7 @@
 
           mkdir -p "${tmpDir}"
           export TMPDIR="${tmpDir}"
+          export JAVA_TOOL_OPTIONS="-Djava.io.tmpdir=${tmpDir}"
 
           if [ ! -d "${venvDir}" ]; then
             python -m venv "${venvDir}"
@@ -71,6 +72,7 @@
 
           mkdir -p "${tmpDir}" "${runDir}"
           export TMPDIR="${tmpDir}"
+          export JAVA_TOOL_OPTIONS="-Djava.io.tmpdir=${tmpDir}"
           rm -f "${signalSocketPath}"
 
           exec signal-cli -u "$SIGNAL_ACCOUNT" daemon --socket "${signalSocketPath}" --receive-mode on-connection
@@ -131,6 +133,7 @@
         Environment=SIGNAL_CLIENT_MODE=daemon
         Environment=SIGNAL_DAEMON_SOCKET_PATH=${signalSocketPath}
         Environment=TMPDIR=${tmpDir}
+        Environment=JAVA_TOOL_OPTIONS=-Djava.io.tmpdir=${tmpDir}
         EnvironmentFile=${repoDir}/.env
 
         [Install]
@@ -155,6 +158,7 @@
         StandardError=journal
 
         Environment=TMPDIR=${tmpDir}
+        Environment=JAVA_TOOL_OPTIONS=-Djava.io.tmpdir=${tmpDir}
         EnvironmentFile=${repoDir}/.env
 
         [Install]
