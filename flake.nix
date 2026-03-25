@@ -16,6 +16,7 @@
 
       repoDir = "/srv/veganactivistsnl-bot";
       venvDir = "${repoDir}/.venv";
+      tmpDir = "${repoDir}/tmp";
 
       runtimePkgs = [
         pkgs.bash
@@ -31,6 +32,9 @@
         text = ''
           set -euo pipefail
           cd "${repoDir}"
+
+          mkdir -p "${tmpDir}"
+          export TMPDIR="${tmpDir}"
 
           if [ ! -d "${venvDir}" ]; then
             python -m venv "${venvDir}"
@@ -97,6 +101,7 @@
         StandardOutput=journal
         StandardError=journal
 
+        Environment=TMPDIR=${tmpDir}
         EnvironmentFile=${repoDir}/.env
 
         [Install]

@@ -6,6 +6,7 @@ __pycache__/
 *.egg-info/
 .venv/
 .env
+tmp/
 
 # Bot state
 /data/*.json
