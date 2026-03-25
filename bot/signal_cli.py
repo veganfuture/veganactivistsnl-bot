@@ -1,8 +1,7 @@
 import asyncio
-import contextlib
 import json
 from dataclasses import dataclass
-from typing import Iterable, AsyncIterator
+from typing import Iterable
 
 from loguru import logger
 from pydantic import BaseModel, Field
@@ -12,6 +11,25 @@ class GroupMember(BaseModel):
     uuid: str | None = None
     number: str | None = None
     name: str | None = None
+    username: str | None = None
+
+
+class ContactRecipient(BaseModel):
+    uuid: str | None = None
+    number: str | None = None
+    name: str | None = None
+    username: str | None = None
+    given_name: str | None = Field(default=None, alias="givenName")
+    family_name: str | None = Field(default=None, alias="familyName")
+    nick_name: str | None = Field(default=None, alias="nickName")
+    nick_given_name: str | None = Field(default=None, alias="nickGivenName")
+    nick_family_name: str | None = Field(default=None, alias="nickFamilyName")
+    profile: "ContactProfile | None" = None
+
+
+class ContactProfile(BaseModel):
+    given_name: str | None = Field(default=None, alias="givenName")
+    family_name: str | None = Field(default=None, alias="familyName")
 
 
 class SignalGroup(BaseModel):
@@ -51,37 +69,67 @@ class DataMessage(BaseModel):
     group_id: str | None = Field(default=None, alias="groupId")
 
 
+class SyncSentMessage(BaseModel):
+    group_info: GroupInfo | None = Field(default=None, alias="groupInfo")
+    group_v2: GroupV2 | None = Field(default=None, alias="groupV2")
+    group_change: dict | None = Field(default=None, alias="groupChange")
+    group_id: str | None = Field(default=None, alias="groupId")
+
+
+class SyncMessage(BaseModel):
+    sent_message: SyncSentMessage | None = Field(default=None, alias="sentMessage")
+
+
 class Envelope(BaseModel):
     data_message: DataMessage | None = Field(default=None, alias="dataMessage")
+    sync_message: SyncMessage | None = Field(default=None, alias="syncMessage")
 
 
 class SignalPayload(BaseModel):
     envelope: Envelope | None = None
 
     def extract_group_id(self) -> str | None:
-        envelope = self.envelope
-        if not envelope or not envelope.data_message:
+        message = self._group_message()
+        if message is None:
             return None
-        data_message = envelope.data_message
-        group_info = data_message.group_info
+        group_info = message.group_info
         if group_info and (group_info.group_id or group_info.group_id_v2):
             return group_info.group_id or group_info.group_id_v2
-        group_v2 = data_message.group_v2
+        group_v2 = message.group_v2
         if group_v2 and (group_v2.group_id or group_v2.group_id_v2):
             return group_v2.group_id or group_v2.group_id_v2
-        return data_message.group_id
+        return message.group_id
 
     def is_group_update(self) -> bool:
-        envelope = self.envelope
-        if not envelope or not envelope.data_message:
+        message = self._group_message()
+        if message is None:
             return False
-        data_message = envelope.data_message
-        group_info = data_message.group_info
+        group_info = message.group_info
         if group_info and group_info.type == "UPDATE":
             return True
-        if data_message.group_change or data_message.group_v2:
+        if message.group_change or message.group_v2:
             return True
         return False
+
+    def _group_message(self) -> DataMessage | SyncSentMessage | None:
+        envelope = self.envelope
+        if not envelope:
+            return None
+        if envelope.data_message:
+            return envelope.data_message
+        if envelope.sync_message and envelope.sync_message.sent_message:
+            return envelope.sync_message.sent_message
+        return None
+
+    def describe_event(self) -> str:
+        envelope = self.envelope
+        if not envelope:
+            return "no-envelope"
+        if envelope.data_message:
+            return "data-message"
+        if envelope.sync_message and envelope.sync_message.sent_message:
+            return "sync-sent-message"
+        return "unhandled-envelope"
 
 
 @dataclass
@@ -98,8 +146,15 @@ class SignalCliError(RuntimeError):
 
 
 class SignalCliClient:
-    def __init__(self, account: str) -> None:
+    def __init__(
+        self,
+        account: str,
+        command_timeout_seconds: float = 30.0,
+        receive_timeout_seconds: int = 5,
+    ) -> None:
         self.account = account
+        self.command_timeout_seconds = command_timeout_seconds
+        self.receive_timeout_seconds = receive_timeout_seconds
 
     async def _run(self, *args: str, check: bool = True) -> CommandResult:
         logger.debug("signal-cli exec: {}", " ".join(args))
@@ -108,7 +163,23 @@ class SignalCliClient:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await proc.communicate()
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(),
+                timeout=self.command_timeout_seconds,
+            )
+        except asyncio.TimeoutError as exc:
+            if proc.returncode is None:
+                proc.terminate()
+                await proc.wait()
+            message = (
+                f"signal-cli command timed out after "
+                f"{self.command_timeout_seconds:.1f}s: {' '.join(args)}"
+            )
+            raise SignalCliError(
+                message,
+                CommandResult(stdout="", stderr=message, returncode=-1),
+            ) from exc
         result = CommandResult(
             stdout=stdout.decode("utf-8", errors="replace"),
             stderr=stderr.decode("utf-8", errors="replace"),
@@ -150,12 +221,28 @@ class SignalCliClient:
         return []
 
     async def get_group_by_id(self, group_id: str) -> SignalGroup | None:
-        all_groups = await self.list_groups(group_id=group_id)
+        all_groups = await self.list_groups()
         return next((g for g in all_groups if g.resolved_id == group_id), None)
 
     async def get_group_by_name(self, group_name: str) -> SignalGroup | None:
         all_groups = await self.list_groups()
         return next((g for g in all_groups if g.name == group_name), None)
+
+    async def list_contacts(self) -> list[ContactRecipient]:
+        data = await self._run_json(
+            "signal-cli",
+            "-u",
+            self.account,
+            "-o",
+            "json",
+            "listContacts",
+            "--all-recipients",
+        )
+        if not isinstance(data, list):
+            return []
+        return [
+            ContactRecipient.model_validate(item) for item in data if isinstance(item, dict)
+        ]
 
     async def send_group_message(self, group_id: str, message: str) -> None:
         await self._run(
@@ -177,7 +264,7 @@ class SignalCliClient:
             "sendSyncRequest",
         )
 
-    async def receive_events(self) -> AsyncIterator[SignalPayload]:
+    async def receive_events(self) -> list[SignalPayload]:
         proc = await asyncio.create_subprocess_exec(
             "signal-cli",
             "-u",
@@ -185,31 +272,42 @@ class SignalCliClient:
             "-o",
             "json",
             "receive",
+            "--timeout",
+            str(self.receive_timeout_seconds),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stderr_task = asyncio.create_task(self._log_stream("signal-cli: ", proc.stderr))
-        try:
-            assert proc.stdout is not None
-            while True:
-                line = await proc.stdout.readline()
-                if not line:
-                    break
-                try:
-                    payload = SignalPayload.model_validate_json(
-                        line.decode("utf-8", errors="replace")
-                    )
-                except ValueError as exc:
-                    logger.debug("signal-cli payload parse error: {}", exc)
-                    continue
-                yield payload
-        finally:
-            stderr_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await stderr_task
-            if proc.returncode is None:
-                proc.terminate()
-                await proc.wait()
+        stdout, stderr = await proc.communicate()
+        self._log_output("signal-cli: ", stderr.decode("utf-8", errors="replace"))
+        if proc.returncode not in (0, None):
+            message = stderr.decode("utf-8", errors="replace").strip()
+            raise SignalCliError(
+                message or "signal-cli receive failed",
+                CommandResult(
+                    stdout=stdout.decode("utf-8", errors="replace"),
+                    stderr=stderr.decode("utf-8", errors="replace"),
+                    returncode=proc.returncode,
+                ),
+            )
+        events: list[SignalPayload] = []
+        for line in stdout.decode("utf-8", errors="replace").splitlines():
+            if not line.strip():
+                continue
+            try:
+                payload = SignalPayload.model_validate_json(line)
+            except ValueError as exc:
+                logger.debug("signal-cli payload parse error: {}", exc)
+                continue
+            logger.debug("signal-cli event type: {}", payload.describe_event())
+            events.append(payload)
+        return events
+
+    @staticmethod
+    def _log_output(prefix: str, text: str) -> None:
+        for line in text.splitlines():
+            rendered = line.rstrip()
+            if rendered:
+                logger.debug("{}{}", prefix, rendered)
 
     async def group_members(self, group_id: str) -> list[GroupMember]:
         groups = await self.list_groups()
@@ -227,19 +325,6 @@ class SignalCliClient:
             elif member.number:
                 keys.append(member.number)
         return keys
-
-    @staticmethod
-    async def _log_stream(prefix: str, stream: asyncio.StreamReader | None) -> None:
-        if stream is None:
-            return
-        while True:
-            line = await stream.readline()
-            if not line:
-                return
-            text = line.decode("utf-8", errors="replace").rstrip()
-            if text:
-                logger.debug("{}{}", prefix, text)
-
 
 def normalize_member_set(members: Iterable[GroupMember]) -> set[str]:
     result = set()

@@ -11,6 +11,8 @@ DEFAULT_STATE_MAX_AGE_SECONDS = 15 * 60
 DEFAULT_WELCOME_MESSAGE = "Welcome {{newusers}} to the group!"
 DEFAULT_WELCOME_GROUP = "Intro - Vegan Activists NL"
 DEFAULT_SYNC_ON_STARTUP = True
+DEFAULT_SIGNAL_CLI_TIMEOUT_SECONDS = 30.0
+DEFAULT_SIGNAL_RECEIVE_TIMEOUT_SECONDS = 5
 
 
 def main() -> None:
@@ -25,6 +27,10 @@ def main() -> None:
         raise ValueError("WELCOME_MESSAGE is required, set it or use --welcome-message")
     if args.state_max_age_seconds <= 0:
         raise ValueError("--state-max-age-seconds must be greater than zero")
+    if args.signal_cli_timeout_seconds <= 0:
+        raise ValueError("--signal-cli-timeout-seconds must be greater than zero")
+    if args.signal_receive_timeout_seconds <= 0:
+        raise ValueError("--signal-receive-timeout-seconds must be greater than zero")
     run_bot(
         account=args.account,
         state_path=args.state_path,
@@ -32,6 +38,8 @@ def main() -> None:
         welcome_message=args.welcome_message,
         state_max_age_seconds=args.state_max_age_seconds,
         sync_on_startup=args.sync_on_startup,
+        signal_cli_timeout_seconds=args.signal_cli_timeout_seconds,
+        signal_receive_timeout_seconds=args.signal_receive_timeout_seconds,
     )
 
 
@@ -83,6 +91,34 @@ def _parse_args() -> argparse.Namespace:
             DEFAULT_SYNC_ON_STARTUP,
         ),
         help="Send a Signal sync request on startup (or set SIGNAL_SYNC_ON_STARTUP)",
+    )
+    parser.add_argument(
+        "--signal-cli-timeout-seconds",
+        type=float,
+        default=float(
+            os.environ.get(
+                "SIGNAL_CLI_TIMEOUT_SECONDS",
+                DEFAULT_SIGNAL_CLI_TIMEOUT_SECONDS,
+            )
+        ),
+        help=(
+            "Timeout for one-shot signal-cli commands in seconds "
+            "(or set SIGNAL_CLI_TIMEOUT_SECONDS)"
+        ),
+    )
+    parser.add_argument(
+        "--signal-receive-timeout-seconds",
+        type=int,
+        default=int(
+            os.environ.get(
+                "SIGNAL_RECEIVE_TIMEOUT_SECONDS",
+                DEFAULT_SIGNAL_RECEIVE_TIMEOUT_SECONDS,
+            )
+        ),
+        help=(
+            "Timeout for each receive polling cycle in seconds "
+            "(or set SIGNAL_RECEIVE_TIMEOUT_SECONDS)"
+        ),
     )
     return parser.parse_args()
 

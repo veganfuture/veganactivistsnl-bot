@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import time
 from pathlib import Path
+import re
 
 from loguru import logger
 from pydantic import BaseModel, Field
 
-from bot.signal_cli import SignalCliClient, SignalPayload
+from bot.signal_cli import ContactRecipient, GroupMember, SignalCliClient, SignalPayload
 
 
 def run_bot(
@@ -18,6 +18,8 @@ def run_bot(
     welcome_message: str,
     state_max_age_seconds: int,
     sync_on_startup: bool,
+    signal_cli_timeout_seconds: float,
+    signal_receive_timeout_seconds: int,
 ) -> None:
     resolved_path = Path(state_path)
     try:
@@ -29,6 +31,8 @@ def run_bot(
                 welcome_message=welcome_message,
                 state_max_age_seconds=state_max_age_seconds,
                 sync_on_startup=sync_on_startup,
+                signal_cli_timeout_seconds=signal_cli_timeout_seconds,
+                signal_receive_timeout_seconds=signal_receive_timeout_seconds,
             )
         )
     except KeyboardInterrupt:
@@ -42,10 +46,16 @@ async def _run(
     welcome_message: str,
     state_max_age_seconds: int,
     sync_on_startup: bool,
+    signal_cli_timeout_seconds: float,
+    signal_receive_timeout_seconds: int,
 ) -> None:
     logger.info("Starting signal bot for account {}", account)
 
-    client = SignalCliClient(account)
+    client = SignalCliClient(
+        account,
+        command_timeout_seconds=signal_cli_timeout_seconds,
+        receive_timeout_seconds=signal_receive_timeout_seconds,
+    )
     if sync_on_startup:
         logger.info("Requesting Signal sync on startup")
         await client.send_sync_request()
@@ -60,7 +70,7 @@ async def _run(
         logger.info("Bot state seeded")
 
     while True:
-        async for payload in client.receive_events():
+        for payload in await client.receive_events():
             logger.debug(payload)
             if is_welcome_group_update(payload, state):
                 try:
@@ -72,7 +82,9 @@ async def _run(
                     )
                 except RuntimeError as exc:
                     logger.error("Error handling group update: {}", exc)
+        logger.debug("sleep")
         await asyncio.sleep(2)
+        logger.debug("receive")
 
 
 class BotState(BaseModel):
@@ -129,7 +141,21 @@ async def _greet_new_welcome_group_members(
         state.welcome_group_members = sorted(members)
         _save_state(state, state_path)
         return
+
     new_members = members - known_members
+    removed_members = known_members - members
+    contacts = await client.list_contacts()
+    contacts_by_id = _contacts_by_id(contacts)
+    if removed_members:
+        removed_member_names = [
+            _render_member_name_by_id(member_id, contacts_by_id)
+            for member_id in sorted(removed_members)
+        ]
+        logger.info(
+            "Members left group {}: {}",
+            group_id,
+            _render_welcome_targets(removed_member_names, len(removed_members)),
+        )
     if not new_members:
         state.welcome_group_members = sorted(members)
         _save_state(state, state_path)
@@ -138,11 +164,11 @@ async def _greet_new_welcome_group_members(
     # Greet new members
     group_members = await client.group_members(group_id)
     new_member_names = [
-        member.name or member.number or member.uuid
+        _render_member_name(member, contacts_by_id)
         for member in group_members
         if (member.uuid or member.number) in new_members
     ]
-    rendered_names = ", ".join(name for name in new_member_names if name)
+    rendered_names = _render_welcome_targets(new_member_names, len(new_members))
     message = welcome_message.replace("{{newusers}}", rendered_names)
     await client.send_group_message(group_id, message)
     logger.info("Sent welcome message to group {}", group_id)
@@ -173,3 +199,168 @@ def _load_state(
         return None
 
     return BotState.model_validate_json(state_path.read_text())
+
+
+def _contacts_by_id(contacts: list[ContactRecipient]) -> dict[str, ContactRecipient]:
+    """
+    Build a contact lookup by Signal recipient id.
+
+    Args:
+    - contacts - contacts returned by signal-cli
+
+    Returns: mapping from uuid or number to contact
+    """
+    result: dict[str, ContactRecipient] = {}
+    for contact in contacts:
+        if contact.uuid:
+            result[contact.uuid] = contact
+        if contact.number:
+            result[contact.number] = contact
+    return result
+
+
+def _render_member_name(
+    member: GroupMember,
+    contacts_by_id: dict[str, ContactRecipient],
+) -> str:
+    """
+    Render the preferred welcome name for a group member.
+
+    Args:
+    - member - group member returned by signal-cli
+    - contacts_by_id - lookup of contacts by Signal recipient id
+
+    Returns: rendered member name for the welcome message
+    """
+    member_id = member.uuid or member.number
+    contact = contacts_by_id.get(member_id) if member_id else None
+
+    contact_name = _preferred_contact_name(contact)
+    if contact_name:
+        return contact_name
+
+    if member.name and not _looks_like_phone_number(member.name):
+        return member.name
+    username = _normalize_username(
+        contact.username if contact and contact.username else member.username
+    )
+    if username:
+        return username
+    if contact and contact.name and not _looks_like_phone_number(contact.name):
+        return contact.name
+    return ""
+
+
+def _render_member_name_by_id(
+    member_id: str,
+    contacts_by_id: dict[str, ContactRecipient],
+) -> str:
+    """
+    Render the preferred name for a member when only the recipient id is known.
+
+    Args:
+    - member_id - Signal recipient id
+    - contacts_by_id - lookup of contacts by Signal recipient id
+
+    Returns: rendered member name for logs
+    """
+    contact = contacts_by_id.get(member_id)
+    contact_name = _preferred_contact_name(contact)
+    if contact_name:
+        return contact_name
+    username = _normalize_username(contact.username if contact else None)
+    if username:
+        return username
+    return ""
+
+
+def _render_welcome_targets(names: list[str], new_member_count: int) -> str:
+    """
+    Render the welcome target string without exposing phone numbers.
+
+    Args:
+    - names - candidate rendered names for the new members
+    - new_member_count - number of members who joined
+
+    Returns: welcome target text
+    """
+    rendered_names = [name for name in names if name]
+    if rendered_names:
+        return ", ".join(rendered_names)
+    if new_member_count == 1:
+        return "our new member"
+    return "our new members"
+
+
+def _preferred_contact_name(contact: ContactRecipient | None) -> str:
+    """
+    Extract the best non-phone human-readable name from a Signal contact.
+
+    Args:
+    - contact - contact returned by signal-cli
+
+    Returns: preferred contact name, or an empty string
+    """
+    if contact is None:
+        return ""
+
+    candidates = [
+        _join_name_parts(
+            contact.profile.given_name if contact.profile else None,
+            contact.profile.family_name if contact.profile else None,
+        ),
+        _join_name_parts(contact.given_name, contact.family_name),
+        _join_name_parts(contact.nick_given_name, contact.nick_family_name),
+        contact.nick_name,
+        contact.name,
+    ]
+    for candidate in candidates:
+        if candidate and not _looks_like_phone_number(candidate):
+            return candidate
+    return ""
+
+
+def _join_name_parts(first: str | None, last: str | None) -> str:
+    """
+    Join optional name parts into a single display name.
+
+    Args:
+    - first - first or given name
+    - last - last or family name
+
+    Returns: combined display name, or an empty string
+    """
+    parts = [part.strip() for part in [first, last] if part and part.strip()]
+    return " ".join(parts)
+
+
+def _normalize_username(username: str | None) -> str | None:
+    """
+    Normalize a Signal username to @handle form.
+
+    Args:
+    - username - username returned by signal-cli
+
+    Returns: username prefixed with @, or None
+    """
+    if not username:
+        return None
+    normalized = username.strip()
+    if not normalized:
+        return None
+    if normalized.startswith("@"):
+        return normalized
+    return f"@{normalized}"
+
+
+def _looks_like_phone_number(value: str) -> bool:
+    """
+    Detect whether a string is probably a phone number.
+
+    Args:
+    - value - rendered member value
+
+    Returns: True when the value resembles a phone number
+    """
+    normalized = re.sub(r"[\s().-]", "", value)
+    return bool(re.fullmatch(r"\+?\d{7,}", normalized))
