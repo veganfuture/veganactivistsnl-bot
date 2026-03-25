@@ -131,6 +131,8 @@ Then run the flake installer:
 nix run .#install
 ```
 
+The installer writes the systemd units to run as the current shell user.
+
 This installs and enables:
 
 * `bot.service`

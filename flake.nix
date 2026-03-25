@@ -129,12 +129,19 @@
 
       install = pkgs.writeShellApplication {
         name = "bot-install";
-        runtimeInputs = [pkgs.bash pkgs.coreutils pkgs.systemd];
+        runtimeInputs = [pkgs.bash pkgs.coreutils pkgs.gnused pkgs.systemd];
         text = ''
           set -euo pipefail
 
-          sudo install -m 0644 ${serviceUnit} /etc/systemd/system/bot.service
-          sudo install -m 0644 ${pollServiceUnit} /etc/systemd/system/bot-poll.service
+          bot_user="''${SUDO_USER:-$USER}"
+          temp_dir="$(mktemp -d)"
+          trap 'rm -rf "$temp_dir"' EXIT
+
+          sed "s/^User=.*/User=$bot_user/" ${serviceUnit} > "$temp_dir/bot.service"
+          sed "s/^User=.*/User=$bot_user/" ${pollServiceUnit} > "$temp_dir/bot-poll.service"
+
+          sudo install -m 0644 "$temp_dir/bot.service" /etc/systemd/system/bot.service
+          sudo install -m 0644 "$temp_dir/bot-poll.service" /etc/systemd/system/bot-poll.service
           sudo install -m 0644 ${pollTimerUnit} /etc/systemd/system/bot-poll.timer
 
           sudo systemctl daemon-reload
@@ -144,6 +151,7 @@
           echo "Installed and started:"
           echo " - bot.service"
           echo " - bot-poll.timer"
+          echo " - user: $bot_user"
         '';
       };
     in {
