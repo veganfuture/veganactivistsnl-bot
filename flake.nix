@@ -96,8 +96,7 @@
         StandardOutput=journal
         StandardError=journal
 
-        # Optional: if you want env vars (tokens, phone number, etc.)
-        # EnvironmentFile=${repoDir}/.env
+        EnvironmentFile=${repoDir}/.env
 
         [Install]
         WantedBy=multi-user.target

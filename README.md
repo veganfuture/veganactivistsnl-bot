@@ -114,10 +114,20 @@ After this try to run the bot manually first, see "Run the bot locally".
 
 ## 4. Install services
 
-Run the flake installer:
+Before installing the services, create an env file that systemd will load for the bot:
 
 ```
 cd /srv/veganactivistsnl-bot
+cat > .env <<'EOF'
+SIGNAL_ACCOUNT=+123456789
+EOF
+```
+
+`bot.service` reads `/srv/veganactivistsnl-bot/.env`, so make sure `SIGNAL_ACCOUNT` is set correctly before you start the service.
+
+Then run the flake installer:
+
+```
 nix run .#install
 ```
 
