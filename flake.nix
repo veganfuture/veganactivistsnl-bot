@@ -53,7 +53,6 @@
           fi
 
           exec python -m bot \
-            --signal-client-mode daemon \
             --signal-daemon-socket-path "${signalSocketPath}"
         '';
       };
@@ -160,7 +159,6 @@
         StandardOutput=journal
         StandardError=journal
 
-        Environment=SIGNAL_CLIENT_MODE=daemon
         Environment=SIGNAL_DAEMON_SOCKET_PATH=${signalSocketPath}
         Environment=TMPDIR=${tmpDir}
         Environment=JAVA_TOOL_OPTIONS=-Djava.io.tmpdir=${tmpDir}

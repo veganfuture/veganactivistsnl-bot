@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from bot.signal_cli import (
     ContactRecipient,
     GroupMember,
+    SignalGroup,
     SignalClient,
     SignalPayload,
     create_signal_client,
@@ -27,11 +28,22 @@ class BotConfig:
     welcome_message_min_interval_seconds: int
     state_max_age_seconds: int
     sync_on_startup: bool
-    signal_client_mode: str
     signal_cli_timeout_seconds: float
     signal_receive_timeout_seconds: int
     receive_poll_delay_seconds: float
-    signal_daemon_socket_path: Path | None
+    signal_daemon_socket_path: Path
+    group_cache_ttl_seconds: float
+    contacts_cache_ttl_seconds: float
+
+
+@dataclass
+class BotRuntime:
+    group_cache_ttl_seconds: float
+    contacts_cache_ttl_seconds: float
+    cached_welcome_group: SignalGroup | None = None
+    cached_welcome_group_fetched_at: float | None = None
+    cached_contacts_by_id: dict[str, ContactRecipient] | None = None
+    cached_contacts_fetched_at: float | None = None
 
 
 class BotState(BaseModel):
@@ -49,6 +61,9 @@ def run_bot(config: BotConfig) -> None:
         asyncio.run(_run(config))
     except KeyboardInterrupt:
         pass
+    except Exception:
+        logger.exception("Signal bot crashed")
+        raise
 
 
 async def _run(config: BotConfig) -> None:
@@ -56,11 +71,14 @@ async def _run(config: BotConfig) -> None:
     logger.info("Bot config: {}", config)
 
     client = create_signal_client(
-        mode=config.signal_client_mode,
         account=config.account,
         command_timeout_seconds=config.signal_cli_timeout_seconds,
         receive_timeout_seconds=config.signal_receive_timeout_seconds,
         daemon_socket_path=config.signal_daemon_socket_path,
+    )
+    runtime = BotRuntime(
+        group_cache_ttl_seconds=config.group_cache_ttl_seconds,
+        contacts_cache_ttl_seconds=config.contacts_cache_ttl_seconds,
     )
     try:
         if config.sync_on_startup:
@@ -78,12 +96,18 @@ async def _run(config: BotConfig) -> None:
             await _discard_startup_backlog(client)
 
         while True:
-            for payload in await client.receive_events():
+            try:
+                payloads = await client.receive_events()
+            except Exception:
+                logger.exception("Failed while receiving Signal events")
+                raise
+            for payload in payloads:
                 logger.debug(payload)
                 if is_welcome_group_update(payload, state):
                     try:
                         await _greet_new_welcome_group_members(
                             client,
+                            runtime,
                             state,
                             config.state_path,
                             config.welcome_message,
@@ -94,6 +118,7 @@ async def _run(config: BotConfig) -> None:
             try:
                 await _flush_pending_welcome_messages(
                     client,
+                    runtime,
                     state,
                     config.state_path,
                     config.welcome_message,
@@ -162,6 +187,7 @@ def is_welcome_group_update(payload: SignalPayload, state: BotState) -> bool:
 
 async def _greet_new_welcome_group_members(
     client: SignalClient,
+    runtime: BotRuntime,
     state: BotState,
     state_path: Path,
     welcome_message: str,
@@ -169,7 +195,7 @@ async def _greet_new_welcome_group_members(
 ) -> None:
     # Get group info
     group_id = state.welcome_group_id
-    group = await client.get_group_by_id(group_id)
+    group = await _get_welcome_group(client, runtime, state.welcome_group_id, force_refresh=True)
     if group is None:
         logger.error(f"Could not resolve group info for welcome group!")
         return
@@ -196,8 +222,7 @@ async def _greet_new_welcome_group_members(
     )
     contacts_by_id: dict[str, ContactRecipient] = {}
     if removed_members:
-        contacts = await client.list_contacts()
-        contacts_by_id = _contacts_by_id(contacts)
+        contacts_by_id = await _get_contacts_by_id(client, runtime)
     if removed_members:
         pending_members -= removed_members
         removed_member_names = [
@@ -231,7 +256,7 @@ async def _greet_new_welcome_group_members(
         return
 
     await _send_welcome_messages(
-        client, state, state_path, welcome_message, pending_members, now
+        client, runtime, state, state_path, welcome_message, pending_members, now, group
     )
 
 
@@ -266,6 +291,7 @@ def _load_state(
 
 async def _flush_pending_welcome_messages(
     client: SignalClient,
+    runtime: BotRuntime,
     state: BotState,
     state_path: Path,
     welcome_message: str,
@@ -288,20 +314,30 @@ async def _flush_pending_welcome_messages(
         return
 
     await _send_welcome_messages(
-        client, state, state_path, welcome_message, pending_members, now
+        client, runtime, state, state_path, welcome_message, pending_members, now, None
     )
 
 
 async def _send_welcome_messages(
     client: SignalClient,
+    runtime: BotRuntime,
     state: BotState,
     state_path: Path,
     welcome_message: str,
     new_members: set[str],
     now: float,
+    group: SignalGroup | None,
 ) -> None:
     # Check that the pending members are still part of the group
-    group = await client.get_group_by_id(state.welcome_group_id)
+    resolved_group = group
+    if resolved_group is None:
+        resolved_group = await _get_welcome_group(
+            client,
+            runtime,
+            state.welcome_group_id,
+            force_refresh=False,
+        )
+    group = resolved_group
     if group is None:
         logger.error("Could not resolve group info for pending welcomes!")
         return
@@ -315,8 +351,8 @@ async def _send_welcome_messages(
         return
 
     # Resolve names of pending members
-    contacts_by_id = _contacts_by_id(await client.list_contacts())
-    group_members = await client.group_members(state.welcome_group_id)
+    contacts_by_id = await _get_contacts_by_id(client, runtime)
+    group_members = group.members
     pending_member_names = [
         _render_member_name(member, contacts_by_id)
         for member in group_members
@@ -338,6 +374,67 @@ async def _send_welcome_messages(
         state.welcome_group_id,
         len(new_members),
     )
+
+
+async def _get_welcome_group(
+    client: SignalClient,
+    runtime: BotRuntime,
+    welcome_group_id: str,
+    force_refresh: bool,
+) -> SignalGroup | None:
+    """
+    Fetch the welcome group, reusing a short-lived cache when safe.
+
+    Args:
+    - client - Signal client used by the bot
+    - runtime - in-memory runtime caches
+    - welcome_group_id - resolved Signal group id
+    - force_refresh - whether to bypass the cache
+
+    Returns: welcome group details, if found
+    """
+    now = time.time()
+    if (
+        not force_refresh
+        and runtime.cached_welcome_group is not None
+        and runtime.cached_welcome_group.resolved_id == welcome_group_id
+        and runtime.cached_welcome_group_fetched_at is not None
+        and now - runtime.cached_welcome_group_fetched_at <= runtime.group_cache_ttl_seconds
+    ):
+        return runtime.cached_welcome_group
+
+    group = await client.get_group_by_id(welcome_group_id)
+    if group is not None:
+        runtime.cached_welcome_group = group
+        runtime.cached_welcome_group_fetched_at = now
+    return group
+
+
+async def _get_contacts_by_id(
+    client: SignalClient,
+    runtime: BotRuntime,
+) -> dict[str, ContactRecipient]:
+    """
+    Fetch contacts and build a cached lookup.
+
+    Args:
+    - client - Signal client used by the bot
+    - runtime - in-memory runtime caches
+
+    Returns: mapping from uuid or number to contact
+    """
+    now = time.time()
+    if (
+        runtime.cached_contacts_by_id is not None
+        and runtime.cached_contacts_fetched_at is not None
+        and now - runtime.cached_contacts_fetched_at <= runtime.contacts_cache_ttl_seconds
+    ):
+        return runtime.cached_contacts_by_id
+
+    contacts_by_id = _contacts_by_id(await client.list_contacts())
+    runtime.cached_contacts_by_id = contacts_by_id
+    runtime.cached_contacts_fetched_at = now
+    return contacts_by_id
 
 
 def _duration_till_welcome_msg(

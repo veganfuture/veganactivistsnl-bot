@@ -180,7 +180,7 @@ No manual deployment is required.
 nix run .#run
 ```
 
-This uses the persistent `signal-cli` daemon by default, so for local testing the most reliable flow is:
+This uses the persistent `signal-cli` daemon, so for local testing the most reliable flow is:
 
 1. Create a local `.env` file:
 
@@ -232,7 +232,7 @@ nix develop
 set -a
 source .env
 set +a
-python -m bot --verbose --signal-client-mode daemon --signal-daemon-socket-path "$PWD/run/signal-cli.sock"
+python -m bot --verbose --signal-daemon-socket-path "$PWD/run/signal-cli.sock"
 ```
 
 Or first run 
@@ -248,14 +248,6 @@ SIGNAL_ACCOUNT=+31612345678 python -m bot
 ```
 
 Of course the account phone number needs to match the bot's phone number.
-
-If you want to compare with the old subprocess mode locally, you can force CLI mode:
-
-```bash
-SIGNAL_ACCOUNT=+31612345678 python -m bot --verbose --signal-client-mode cli
-```
-
----
 
 ### Test the update process manually
 
@@ -324,7 +316,8 @@ Example content:
 ```
 SIGNAL_ACCOUNT=+123456789
 BOT_STATE_FILE=/srv/veganactivistsnl-bot/data/group_state.json
-SIGNAL_CLIENT_MODE=daemon
+GROUP_CACHE_TTL_SECONDS=2
+CONTACTS_CACHE_TTL_SECONDS=300
 ```
 
 To enable this, ensure the systemd unit contains:

@@ -213,136 +213,6 @@ class SignalClient(abc.ABC):
         return keys
 
 
-class SignalCliClient(SignalClient):
-    async def _run(self, *args: str, check: bool = True) -> CommandResult:
-        logger.debug("signal-cli exec: {}", " ".join(args))
-        started_at = time.monotonic()
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(),
-                timeout=self.command_timeout_seconds,
-            )
-        except asyncio.TimeoutError as exc:
-            if proc.returncode is None:
-                proc.terminate()
-                await proc.wait()
-            message = (
-                f"signal-cli command timed out after "
-                f"{self.command_timeout_seconds:.1f}s: {' '.join(args)}"
-            )
-            raise SignalCliError(
-                message,
-                CommandResult(stdout="", stderr=message, returncode=-1),
-            ) from exc
-        elapsed = time.monotonic() - started_at
-        result = CommandResult(
-            stdout=stdout.decode("utf-8", errors="replace"),
-            stderr=stderr.decode("utf-8", errors="replace"),
-            returncode=proc.returncode or 0,
-        )
-        if check and result.returncode != 0:
-            logger.debug("signal-cli error ({}s): {}", f"{elapsed:.2f}", result.stderr.strip())
-            raise SignalCliError(result.stderr.strip(), result)
-        logger.debug("signal-cli ok ({}s): {}", f"{elapsed:.2f}", result.stdout.strip())
-        return result
-
-    async def _run_json(self, *args: str) -> object:
-        result = await self._run(*args)
-        return json.loads(result.stdout)
-
-    async def list_groups(self, group_id: str | None = None) -> list[SignalGroup]:
-        base_command = ["signal-cli", "-u", self.account, "-o", "json", "listGroups"]
-        if group_id:
-            base_command.extend(["-g", group_id])
-        data = await self._run_json(*base_command)
-        if isinstance(data, list):
-            groups = [
-                SignalGroup.model_validate(item) for item in data if isinstance(item, dict)
-            ]
-        elif isinstance(data, dict):
-            groups = GroupList.model_validate(data).groups
-        else:
-            groups = []
-        if group_id:
-            return [group for group in groups if group.resolved_id == group_id]
-        return groups
-
-    async def list_contacts(self) -> list[ContactRecipient]:
-        data = await self._run_json(
-            "signal-cli",
-            "-u",
-            self.account,
-            "-o",
-            "json",
-            "listContacts",
-            "--all-recipients",
-        )
-        if not isinstance(data, list):
-            return []
-        return [
-            ContactRecipient.model_validate(item) for item in data if isinstance(item, dict)
-        ]
-
-    async def send_group_message(self, group_id: str, message: str) -> None:
-        await self._run(
-            "signal-cli",
-            "-u",
-            self.account,
-            "send",
-            "-m",
-            message,
-            "-g",
-            group_id,
-        )
-
-    async def send_sync_request(self) -> None:
-        await self._run(
-            "signal-cli",
-            "-u",
-            self.account,
-            "sendSyncRequest",
-        )
-
-    async def receive_events(self) -> list[SignalPayload]:
-        proc = await asyncio.create_subprocess_exec(
-            "signal-cli",
-            "-u",
-            self.account,
-            "-o",
-            "json",
-            "receive",
-            "--timeout",
-            str(self.receive_timeout_seconds),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        self._log_output("signal-cli: ", stderr.decode("utf-8", errors="replace"))
-        if proc.returncode not in (0, None):
-            message = stderr.decode("utf-8", errors="replace").strip()
-            raise SignalCliError(
-                message or "signal-cli receive failed",
-                CommandResult(
-                    stdout=stdout.decode("utf-8", errors="replace"),
-                    stderr=stderr.decode("utf-8", errors="replace"),
-                    returncode=proc.returncode,
-                ),
-            )
-        return _parse_signal_payload_lines(stdout.decode("utf-8", errors="replace"))
-
-    @staticmethod
-    def _log_output(prefix: str, text: str) -> None:
-        for line in text.splitlines():
-            rendered = line.rstrip()
-            if rendered:
-                logger.debug("{}{}", prefix, rendered)
-
-
 class SignalRpcClient(SignalClient):
     def __init__(
         self,
@@ -362,6 +232,7 @@ class SignalRpcClient(SignalClient):
         self._request_id = 0
         self._pending: dict[str, asyncio.Future[object]] = {}
         self._event_queue: asyncio.Queue[SignalPayload] = asyncio.Queue()
+        self._read_failure: SignalCliError | None = None
 
     async def list_groups(self, group_id: str | None = None) -> list[SignalGroup]:
         data = await self._request("listGroups")
@@ -391,6 +262,8 @@ class SignalRpcClient(SignalClient):
         await self._request("sendSyncRequest")
 
     async def receive_events(self) -> list[SignalPayload]:
+        await self._ensure_connected()
+        self._raise_if_read_failed()
         events: list[SignalPayload] = []
         try:
             first_event = await asyncio.wait_for(
@@ -398,6 +271,7 @@ class SignalRpcClient(SignalClient):
                 timeout=self.receive_timeout_seconds,
             )
         except asyncio.TimeoutError:
+            self._raise_if_read_failed()
             return []
         events.append(first_event)
         while True:
@@ -436,6 +310,7 @@ class SignalRpcClient(SignalClient):
         self._fail_pending("signal-cli client closed")
 
     async def _ensure_connected(self) -> None:
+        self._raise_if_read_failed()
         if self._writer is not None and not self._writer.is_closing():
             return
         deadline = time.monotonic() + self.connect_retry_seconds
@@ -457,6 +332,8 @@ class SignalRpcClient(SignalClient):
             self._reader = reader
             self._writer = writer
             self._read_task = asyncio.create_task(self._read_loop())
+            self._read_task.add_done_callback(self._on_read_task_done)
+            logger.info("Connected to signal-cli daemon socket {}", self.socket_path)
             return
         message = (
             f"Could not connect to signal-cli daemon socket {self.socket_path} "
@@ -471,6 +348,7 @@ class SignalRpcClient(SignalClient):
 
     async def _request(self, method: str, params: dict[str, object] | None = None) -> object:
         await self._ensure_connected()
+        self._raise_if_read_failed()
         assert self._writer is not None
         self._request_id += 1
         request_id = str(self._request_id)
@@ -523,7 +401,15 @@ class SignalRpcClient(SignalClient):
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self._fail_pending(str(exc))
+            error = _coerce_signal_error("signal-cli rpc read loop failed", exc)
+            self._read_failure = error
+            self._reader = None
+            writer = self._writer
+            self._writer = None
+            if writer is not None and not writer.is_closing():
+                writer.close()
+            self._fail_pending(str(error))
+            logger.exception("signal-cli rpc read loop failed")
             raise
 
     def _handle_message(self, line: str) -> None:
@@ -576,43 +462,48 @@ class SignalRpcClient(SignalClient):
                 future.set_exception(error)
         self._pending.clear()
 
+    def _raise_if_read_failed(self) -> None:
+        if self._read_failure is not None:
+            raise self._read_failure
+
+    def _on_read_task_done(self, task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except SignalCliError as exc:
+            if self._read_failure is None:
+                self._read_failure = exc
+            logger.error("signal-cli rpc read task stopped: {}", exc)
+        except Exception as exc:
+            error = _coerce_signal_error("signal-cli rpc read task crashed", exc)
+            self._read_failure = error
+            logger.exception("signal-cli rpc read task crashed")
+
 
 def create_signal_client(
-    mode: str,
     account: str,
     command_timeout_seconds: float,
     receive_timeout_seconds: int,
-    daemon_socket_path: Path | None = None,
+    daemon_socket_path: Path,
 ) -> SignalClient:
     """
-    Create a Signal client for the configured transport mode.
+    Create the Signal RPC client.
 
     Args:
-    - mode - transport mode, either "cli" or "daemon"
     - account - Signal account number
     - command_timeout_seconds - timeout for request/command round-trips
     - receive_timeout_seconds - timeout when waiting for new events
-    - daemon_socket_path - Unix socket path for daemon mode
+    - daemon_socket_path - Unix socket path for the Signal RPC daemon
 
     Returns: configured Signal client
     """
-    normalized_mode = mode.strip().lower()
-    if normalized_mode == "cli":
-        return SignalCliClient(
-            account,
-            command_timeout_seconds=command_timeout_seconds,
-            receive_timeout_seconds=receive_timeout_seconds,
-        )
-    if normalized_mode == "daemon":
-        if daemon_socket_path is None:
-            raise ValueError("daemon socket path is required for daemon mode")
-        return SignalRpcClient(
-            account,
-            socket_path=daemon_socket_path,
-            command_timeout_seconds=command_timeout_seconds,
-            receive_timeout_seconds=receive_timeout_seconds,
-        )
-    raise ValueError(f"Unsupported signal client mode: {mode}")
+    return SignalRpcClient(
+        account,
+        socket_path=daemon_socket_path,
+        command_timeout_seconds=command_timeout_seconds,
+        receive_timeout_seconds=receive_timeout_seconds,
+    )
 
 
 def _parse_groups_from_object(data: object) -> list[SignalGroup]:
@@ -621,21 +512,6 @@ def _parse_groups_from_object(data: object) -> list[SignalGroup]:
     if isinstance(data, dict):
         return GroupList.model_validate(data).groups
     return []
-
-
-def _parse_signal_payload_lines(text: str) -> list[SignalPayload]:
-    events: list[SignalPayload] = []
-    for line in text.splitlines():
-        if not line.strip():
-            continue
-        try:
-            payload = SignalPayload.model_validate_json(line)
-        except ValueError as exc:
-            logger.debug("signal-cli payload parse error: {}", exc)
-            continue
-        logger.debug("signal-cli event type: {}", payload.describe_event())
-        events.append(payload)
-    return events
 
 
 def normalize_member_set(members: Iterable[GroupMember]) -> set[str]:
@@ -654,3 +530,13 @@ def extract_group_id(payload: SignalPayload) -> str | None:
 
 def should_check_group(payload: SignalPayload) -> bool:
     return payload.is_group_update()
+
+
+def _coerce_signal_error(message: str, exc: Exception) -> SignalCliError:
+    if isinstance(exc, SignalCliError):
+        return exc
+    rendered_message = f"{message}: {exc}"
+    return SignalCliError(
+        rendered_message,
+        CommandResult(stdout="", stderr=rendered_message, returncode=-1),
+    )
