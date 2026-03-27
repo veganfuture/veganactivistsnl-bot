@@ -27,6 +27,7 @@ DEFAULT_RECEIVE_POLL_DELAY_SECONDS = 0.2
 DEFAULT_SIGNAL_DAEMON_SOCKET_PATH = "/srv/veganactivistsnl-bot/run/signal-cli.sock"
 DEFAULT_GROUP_CACHE_TTL_SECONDS = 2.0
 DEFAULT_CONTACTS_CACHE_TTL_SECONDS = 300.0
+DEFAULT_UNRESOLVED_NAME_RETRY_DELAY_SECONDS = 10.0
 
 
 def main() -> None:
@@ -55,6 +56,10 @@ def main() -> None:
         raise ValueError("--group-cache-ttl-seconds must be zero or greater")
     if args.contacts_cache_ttl_seconds < 0:
         raise ValueError("--contacts-cache-ttl-seconds must be zero or greater")
+    if args.unresolved_name_retry_delay_seconds < 0:
+        raise ValueError(
+            "--unresolved-name-retry-delay-seconds must be zero or greater"
+        )
     config = BotConfig(
         account=args.account,
         state_path=args.state_path,
@@ -69,6 +74,7 @@ def main() -> None:
         signal_daemon_socket_path=args.signal_daemon_socket_path,
         group_cache_ttl_seconds=args.group_cache_ttl_seconds,
         contacts_cache_ttl_seconds=args.contacts_cache_ttl_seconds,
+        unresolved_name_retry_delay_seconds=args.unresolved_name_retry_delay_seconds,
     )
     run_bot(config)
 
@@ -218,6 +224,20 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Reuse Signal contacts for this many seconds "
             "(or set CONTACTS_CACHE_TTL_SECONDS)"
+        ),
+    )
+    parser.add_argument(
+        "--unresolved-name-retry-delay-seconds",
+        type=float,
+        default=float(
+            os.environ.get(
+                "UNRESOLVED_NAME_RETRY_DELAY_SECONDS",
+                DEFAULT_UNRESOLVED_NAME_RETRY_DELAY_SECONDS,
+            )
+        ),
+        help=(
+            "Wait this many seconds before retrying unresolved member names "
+            "(or set UNRESOLVED_NAME_RETRY_DELAY_SECONDS)"
         ),
     )
     return parser.parse_args()

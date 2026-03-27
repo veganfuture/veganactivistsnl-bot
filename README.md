@@ -318,6 +318,7 @@ SIGNAL_ACCOUNT=+123456789
 BOT_STATE_FILE=/srv/veganactivistsnl-bot/data/group_state.json
 GROUP_CACHE_TTL_SECONDS=2
 CONTACTS_CACHE_TTL_SECONDS=300
+UNRESOLVED_NAME_RETRY_DELAY_SECONDS=10
 ```
 
 To enable this, ensure the systemd unit contains:
