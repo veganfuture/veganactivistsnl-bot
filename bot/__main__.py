@@ -23,7 +23,6 @@ DEFAULT_WELCOME_MESSAGE_MIN_INTERVAL_SECONDS = 90
 DEFAULT_SYNC_ON_STARTUP = True
 DEFAULT_SIGNAL_CLI_TIMEOUT_SECONDS = 30.0
 DEFAULT_SIGNAL_RECEIVE_TIMEOUT_SECONDS = 2
-DEFAULT_RECEIVE_POLL_DELAY_SECONDS = 0.2
 DEFAULT_SIGNAL_DAEMON_SOCKET_PATH = "/srv/veganactivistsnl-bot/run/signal-cli.sock"
 DEFAULT_GROUP_CACHE_TTL_SECONDS = 2.0
 DEFAULT_CONTACTS_CACHE_TTL_SECONDS = 300.0
@@ -50,8 +49,6 @@ def main() -> None:
         raise ValueError("--signal-cli-timeout-seconds must be greater than zero")
     if args.signal_receive_timeout_seconds <= 0:
         raise ValueError("--signal-receive-timeout-seconds must be greater than zero")
-    if args.receive_poll_delay_seconds < 0:
-        raise ValueError("--receive-poll-delay-seconds must be zero or greater")
     if args.group_cache_ttl_seconds < 0:
         raise ValueError("--group-cache-ttl-seconds must be zero or greater")
     if args.contacts_cache_ttl_seconds < 0:
@@ -70,7 +67,6 @@ def main() -> None:
         sync_on_startup=args.sync_on_startup,
         signal_cli_timeout_seconds=args.signal_cli_timeout_seconds,
         signal_receive_timeout_seconds=args.signal_receive_timeout_seconds,
-        receive_poll_delay_seconds=args.receive_poll_delay_seconds,
         signal_daemon_socket_path=args.signal_daemon_socket_path,
         group_cache_ttl_seconds=args.group_cache_ttl_seconds,
         contacts_cache_ttl_seconds=args.contacts_cache_ttl_seconds,
@@ -168,20 +164,6 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Timeout for each receive polling cycle in seconds "
             "(or set SIGNAL_RECEIVE_TIMEOUT_SECONDS)"
-        ),
-    )
-    parser.add_argument(
-        "--receive-poll-delay-seconds",
-        type=float,
-        default=float(
-            os.environ.get(
-                "RECEIVE_POLL_DELAY_SECONDS",
-                DEFAULT_RECEIVE_POLL_DELAY_SECONDS,
-            )
-        ),
-        help=(
-            "Delay between receive polling cycles in seconds "
-            "(or set RECEIVE_POLL_DELAY_SECONDS)"
         ),
     )
     parser.add_argument(

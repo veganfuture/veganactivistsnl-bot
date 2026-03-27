@@ -30,7 +30,6 @@ class BotConfig:
     sync_on_startup: bool
     signal_cli_timeout_seconds: float
     signal_receive_timeout_seconds: int
-    receive_poll_delay_seconds: float
     signal_daemon_socket_path: Path
     group_cache_ttl_seconds: float
     contacts_cache_ttl_seconds: float
@@ -104,7 +103,10 @@ async def _run(config: BotConfig) -> None:
                 raise
             for payload in payloads:
                 logger.debug(payload)
-                if is_welcome_group_update(payload, state):
+                if (
+                    payload.is_group_update()
+                    and payload.extract_group_id() == state.welcome_group_id
+                ):
                     try:
                         await _greet_new_welcome_group_members(
                             client,
@@ -129,8 +131,6 @@ async def _run(config: BotConfig) -> None:
                 )
             except RuntimeError as exc:
                 logger.error("Error flushing pending welcomes: {}", exc)
-            if config.receive_poll_delay_seconds > 0:
-                await asyncio.sleep(config.receive_poll_delay_seconds)
     finally:
         await client.close()
         logger.info("Shutting down bot")
@@ -158,14 +158,6 @@ async def _seed_state(client: SignalClient, welcome_group: str) -> BotState:
 
 
 async def _discard_startup_backlog(client: SignalClient) -> None:
-    """
-    Drain queued Signal events after first-time seeding.
-
-    Args:
-    - client - Signal client used by the bot
-
-    Returns: None
-    """
     discarded_event_count = 0
     discarded_batch_count = 0
     while True:
@@ -181,13 +173,6 @@ async def _discard_startup_backlog(client: SignalClient) -> None:
     )
 
 
-def is_welcome_group_update(payload: SignalPayload, state: BotState) -> bool:
-    if not payload.is_group_update():
-        return False
-    group_id = payload.extract_group_id()
-    return group_id == state.welcome_group_id
-
-
 async def _greet_new_welcome_group_members(
     client: SignalClient,
     runtime: BotRuntime,
@@ -199,7 +184,12 @@ async def _greet_new_welcome_group_members(
 ) -> None:
     # Get group info
     group_id = state.welcome_group_id
-    group = await _get_welcome_group(client, runtime, state.welcome_group_id, force_refresh=True)
+    group = await _get_welcome_group(
+        client,
+        runtime,
+        state.welcome_group_id,
+        force_refresh=True,
+    )
     if group is None:
         logger.error(f"Could not resolve group info for welcome group!")
         return
@@ -233,10 +223,17 @@ async def _greet_new_welcome_group_members(
             _render_member_name_by_id(member_id, contacts_by_id)
             for member_id in sorted(removed_members)
         ]
+        resolved_removed_member_names = [
+            name for name in removed_member_names if name is not None
+        ]
         logger.info(
             "Members left group {}: {}",
             group_id,
-            _render_departed_members(removed_member_names, len(removed_members)),
+            ", ".join(resolved_removed_member_names)
+            if resolved_removed_member_names
+            else (
+                "an unnamed member" if len(removed_members) == 1 else "unnamed members"
+            ),
         )
     if new_members:
         pending_members |= new_members
@@ -350,7 +347,26 @@ async def _send_welcome_messages(
     group: SignalGroup | None,
     unresolved_name_retry_delay_seconds: float = 0.0,
 ) -> None:
-    # Check that the pending members are still part of the group
+    """
+    Send the welcome message once pending members are stable enough to greet.
+
+    This function handles the two most stateful pieces of logic in the bot:
+    validating that pending members are still in the group, and retrying name
+    resolution after a sync when Signal initially does not expose user names.
+
+    Args:
+    - client - Signal client used by the bot
+    - runtime - in-memory caches shared by the bot loop
+    - state - persisted bot state
+    - state_path - path to the state file
+    - welcome_message - welcome message template
+    - new_members - pending members to greet
+    - now - current timestamp
+    - group - optional already-fetched group snapshot
+    - unresolved_name_retry_delay_seconds - retry delay when names are unresolved
+
+    Returns: None
+    """
     resolved_group = group
     if resolved_group is None:
         resolved_group = await _get_welcome_group(
@@ -375,14 +391,13 @@ async def _send_welcome_messages(
     # Resolve names of pending members
     contacts_by_id = await _get_contacts_by_id(client, runtime)
     group_members = group.members
-    pending_member_names = _render_pending_member_names(
-        group_members,
-        new_members,
-        contacts_by_id,
-    )
-    if (
-        unresolved_name_retry_delay_seconds > 0
-        and any(candidate is None for candidate in pending_member_names)
+    pending_member_names = [
+        _render_member_name(member, contacts_by_id)
+        for member in group_members
+        if (member.uuid or member.number) in new_members
+    ]
+    if unresolved_name_retry_delay_seconds > 0 and any(
+        candidate is None for candidate in pending_member_names
     ):
         _log_unresolved_members(group_members, new_members, contacts_by_id)
         logger.info(
@@ -408,17 +423,34 @@ async def _send_welcome_messages(
             state.welcome_group_members = sorted(current_member_ids)
             group_members = group.members
         contacts_by_id = await _get_contacts_by_id(client, runtime)
-        pending_member_names = _render_pending_member_names(
-            group_members,
-            new_members,
-            contacts_by_id,
-        )
+        pending_member_names = [
+            _render_member_name(member, contacts_by_id)
+            for member in group_members
+            if (member.uuid or member.number) in new_members
+        ]
         if any(candidate is None for candidate in pending_member_names):
             _log_unresolved_members(group_members, new_members, contacts_by_id)
-    rendered_names = _render_welcome_targets(pending_member_names)
 
-    # Send welcome message
-    message = _render_welcome_message(welcome_message, rendered_names)
+    # Prepare welcome message
+    if any(name is None for name in pending_member_names):
+        message = (
+            welcome_message.replace(" {{newusers}}", "")
+            .replace("{{newusers}} ", "")
+            .replace("{{newusers}}", "")
+        )
+    else:
+        resolved_names = [name for name in pending_member_names if name is not None]
+        if len(resolved_names) == 1:
+            rendered_names = resolved_names[0]
+        elif len(resolved_names) == 2:
+            rendered_names = f"{resolved_names[0]} and {resolved_names[1]}"
+        else:
+            rendered_names = (
+                f"{', '.join(resolved_names[:-1])} and {resolved_names[-1]}"
+            )
+        message = welcome_message.replace("{{newusers}}", rendered_names)
+
+    # Send
     await client.send_group_message(state.welcome_group_id, message)
     state.pending_welcome_members = []
     state.last_welcome_sent_at = now
@@ -428,40 +460,6 @@ async def _send_welcome_messages(
         state.welcome_group_id,
         len(new_members),
     )
-
-
-def _render_pending_member_names(
-    group_members: list[GroupMember],
-    new_members: set[str],
-    contacts_by_id: dict[str, ContactRecipient],
-) -> list[str | None]:
-    """
-    Render pending member names for a welcome message.
-
-    Args:
-    - group_members - current welcome group members
-    - new_members - ids of members to mention
-    - contacts_by_id - lookup of contacts by Signal recipient id
-
-    Returns: ordered rendered names, which may include unresolved None values
-    """
-    return [
-        _render_member_name(member, contacts_by_id)
-        for member in group_members
-        if (member.uuid or member.number) in new_members
-    ]
-
-
-def _resolve_rendered_names(names: list[str | None]) -> list[str]:
-    """
-    Remove unresolved member names from a rendered name list.
-
-    Args:
-    - names - candidate rendered names, possibly including None
-
-    Returns: resolved rendered names only
-    """
-    return [name for name in names if name is not None]
 
 
 def _log_unresolved_members(
@@ -529,7 +527,8 @@ async def _get_welcome_group(
         and runtime.cached_welcome_group is not None
         and runtime.cached_welcome_group.resolved_id == welcome_group_id
         and runtime.cached_welcome_group_fetched_at is not None
-        and now - runtime.cached_welcome_group_fetched_at <= runtime.group_cache_ttl_seconds
+        and now - runtime.cached_welcome_group_fetched_at
+        <= runtime.group_cache_ttl_seconds
     ):
         return runtime.cached_welcome_group
 
@@ -557,11 +556,17 @@ async def _get_contacts_by_id(
     if (
         runtime.cached_contacts_by_id is not None
         and runtime.cached_contacts_fetched_at is not None
-        and now - runtime.cached_contacts_fetched_at <= runtime.contacts_cache_ttl_seconds
+        and now - runtime.cached_contacts_fetched_at
+        <= runtime.contacts_cache_ttl_seconds
     ):
         return runtime.cached_contacts_by_id
 
-    contacts_by_id = _contacts_by_id(await client.list_contacts())
+    contacts_by_id: dict[str, ContactRecipient] = {}
+    for contact in await client.list_contacts():
+        if contact.uuid:
+            contacts_by_id[contact.uuid] = contact
+        if contact.number:
+            contacts_by_id[contact.number] = contact
     runtime.cached_contacts_by_id = contacts_by_id
     runtime.cached_contacts_fetched_at = now
     return contacts_by_id
@@ -582,37 +587,10 @@ def _duration_till_welcome_msg(
     return duration
 
 
-def _contacts_by_id(contacts: list[ContactRecipient]) -> dict[str, ContactRecipient]:
-    """
-    Build a contact lookup by Signal recipient id.
-
-    Args:
-    - contacts - contacts returned by signal-cli
-
-    Returns: mapping from uuid or number to contact
-    """
-    result: dict[str, ContactRecipient] = {}
-    for contact in contacts:
-        if contact.uuid:
-            result[contact.uuid] = contact
-        if contact.number:
-            result[contact.number] = contact
-    return result
-
-
 def _render_member_name(
     member: GroupMember,
     contacts_by_id: dict[str, ContactRecipient],
 ) -> str | None:
-    """
-    Render the preferred welcome name for a group member.
-
-    Args:
-    - member - group member returned by signal-cli
-    - contacts_by_id - lookup of contacts by Signal recipient id
-
-    Returns: rendered member name for the welcome message, or None
-    """
     member_id = member.uuid or member.number
     contact = contacts_by_id.get(member_id) if member_id else None
 
@@ -636,15 +614,6 @@ def _render_member_name_by_id(
     member_id: str,
     contacts_by_id: dict[str, ContactRecipient],
 ) -> str | None:
-    """
-    Render the preferred name for a member when only the recipient id is known.
-
-    Args:
-    - member_id - Signal recipient id
-    - contacts_by_id - lookup of contacts by Signal recipient id
-
-    Returns: rendered member name for logs, or None
-    """
     contact = contacts_by_id.get(member_id)
     contact_name = _preferred_contact_name(contact)
     if contact_name is not None:
@@ -655,82 +624,7 @@ def _render_member_name_by_id(
     return None
 
 
-def _render_welcome_targets(names: list[str | None]) -> list[str] | None:
-    """
-    Resolve welcome target names only when all names are available.
-
-    Args:
-    - names - candidate rendered names for the new members
-
-    Returns: resolved names when all names are available, or None
-    """
-    if any(name is None for name in names):
-        return None
-    return _resolve_rendered_names(names)
-
-
-def _render_departed_members(names: list[str | None], member_count: int) -> str:
-    """
-    Render departed member names for logging.
-
-    Args:
-    - names - candidate rendered names for departed members
-    - member_count - number of members who left
-
-    Returns: rendered departed member text
-    """
-    resolved_names = _resolve_rendered_names(names)
-    if resolved_names:
-        return ", ".join(resolved_names)
-    if member_count == 1:
-        return "an unnamed member"
-    return "unnamed members"
-
-
-def _render_welcome_message(template: str, names: list[str] | None) -> str:
-    """
-    Render the final welcome message with or without explicit member names.
-
-    Args:
-    - template - welcome message template containing {{newusers}}
-    - names - resolved member names, or None when any name is unresolved
-
-    Returns: rendered welcome message
-    """
-    if names is None or not names:
-        return (
-            template.replace(" {{newusers}}", "")
-            .replace("{{newusers}} ", "")
-            .replace("{{newusers}}", "")
-        )
-    return template.replace("{{newusers}}", _join_rendered_names(names))
-
-
-def _join_rendered_names(names: list[str]) -> str:
-    """
-    Join rendered member names into natural-language text.
-
-    Args:
-    - names - resolved member names
-
-    Returns: joined rendered names
-    """
-    if len(names) == 1:
-        return names[0]
-    if len(names) == 2:
-        return f"{names[0]} and {names[1]}"
-    return f"{', '.join(names[:-1])} and {names[-1]}"
-
-
 def _preferred_contact_name(contact: ContactRecipient | None) -> str | None:
-    """
-    Extract the best non-phone human-readable name from a Signal contact.
-
-    Args:
-    - contact - contact returned by signal-cli
-
-    Returns: preferred contact name, or None
-    """
     if contact is None:
         return None
 
@@ -751,15 +645,6 @@ def _preferred_contact_name(contact: ContactRecipient | None) -> str | None:
 
 
 def _join_name_parts(first: str | None, last: str | None) -> str | None:
-    """
-    Join optional name parts into a single display name.
-
-    Args:
-    - first - first or given name
-    - last - last or family name
-
-    Returns: combined display name, or None
-    """
     parts = [part.strip() for part in [first, last] if part and part.strip()]
     if not parts:
         return None
@@ -767,14 +652,6 @@ def _join_name_parts(first: str | None, last: str | None) -> str | None:
 
 
 def _normalize_username(username: str | None) -> str | None:
-    """
-    Normalize a Signal username to @handle form.
-
-    Args:
-    - username - username returned by signal-cli
-
-    Returns: username prefixed with @, or None
-    """
     if not username:
         return None
     normalized = username.strip()
@@ -786,13 +663,5 @@ def _normalize_username(username: str | None) -> str | None:
 
 
 def _looks_like_phone_number(value: str) -> bool:
-    """
-    Detect whether a string is probably a phone number.
-
-    Args:
-    - value - rendered member value
-
-    Returns: True when the value resembles a phone number
-    """
     normalized = re.sub(r"[\s().-]", "", value)
     return bool(re.fullmatch(r"\+?\d{7,}", normalized))
