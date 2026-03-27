@@ -62,45 +62,50 @@ async def _run(config: BotConfig) -> None:
         receive_timeout_seconds=config.signal_receive_timeout_seconds,
         daemon_socket_path=config.signal_daemon_socket_path,
     )
-    if config.sync_on_startup:
-        logger.info("Requesting Signal sync on startup")
-        await client.send_sync_request()
+    try:
+        if config.sync_on_startup:
+            logger.info("Requesting Signal sync on startup")
+            await client.send_sync_request()
 
-    state = _load_state(config.state_path, config.state_max_age_seconds)
-    if state:
-        logger.info(f"Bot state loaded from: {config.state_path}")
-    if not state:
-        logger.info("No bot state found, seeding")
-        state = await _seed_state(client, config.welcome_group)
-        _save_state(state, config.state_path)
-        logger.info("Bot state seeded")
+        state = _load_state(config.state_path, config.state_max_age_seconds)
+        if state:
+            logger.info(f"Bot state loaded from: {config.state_path}")
+        if not state:
+            logger.info("No bot state found, seeding")
+            state = await _seed_state(client, config.welcome_group)
+            _save_state(state, config.state_path)
+            logger.info("Bot state seeded")
+            await _discard_startup_backlog(client)
 
-    while True:
-        for payload in await client.receive_events():
-            logger.debug(payload)
-            if is_welcome_group_update(payload, state):
-                try:
-                    await _greet_new_welcome_group_members(
-                        client,
-                        state,
-                        config.state_path,
-                        config.welcome_message,
-                        config.welcome_message_min_interval_seconds,
-                    )
-                except RuntimeError as exc:
-                    logger.error("Error handling group update: {}", exc)
-        try:
-            await _flush_pending_welcome_messages(
-                client,
-                state,
-                config.state_path,
-                config.welcome_message,
-                config.welcome_message_min_interval_seconds,
-            )
-        except RuntimeError as exc:
-            logger.error("Error flushing pending welcomes: {}", exc)
-        if config.receive_poll_delay_seconds > 0:
-            await asyncio.sleep(config.receive_poll_delay_seconds)
+        while True:
+            for payload in await client.receive_events():
+                logger.debug(payload)
+                if is_welcome_group_update(payload, state):
+                    try:
+                        await _greet_new_welcome_group_members(
+                            client,
+                            state,
+                            config.state_path,
+                            config.welcome_message,
+                            config.welcome_message_min_interval_seconds,
+                        )
+                    except RuntimeError as exc:
+                        logger.error("Error handling group update: {}", exc)
+            try:
+                await _flush_pending_welcome_messages(
+                    client,
+                    state,
+                    config.state_path,
+                    config.welcome_message,
+                    config.welcome_message_min_interval_seconds,
+                )
+            except RuntimeError as exc:
+                logger.error("Error flushing pending welcomes: {}", exc)
+            if config.receive_poll_delay_seconds > 0:
+                await asyncio.sleep(config.receive_poll_delay_seconds)
+    finally:
+        await client.close()
+        logger.info("Shutting down bot")
 
 
 async def _seed_state(client: SignalClient, welcome_group: str) -> BotState:
@@ -121,6 +126,30 @@ async def _seed_state(client: SignalClient, welcome_group: str) -> BotState:
         welcome_group_members=sorted(group.get_member_ids()),
         pending_welcome_members=[],
         last_welcome_sent_at=None,
+    )
+
+
+async def _discard_startup_backlog(client: SignalClient) -> None:
+    """
+    Drain queued Signal events after first-time seeding.
+
+    Args:
+    - client - Signal client used by the bot
+
+    Returns: None
+    """
+    discarded_event_count = 0
+    discarded_batch_count = 0
+    while True:
+        payloads = await client.receive_events()
+        if not payloads:
+            break
+        discarded_batch_count += 1
+        discarded_event_count += len(payloads)
+    logger.info(
+        "Discarded {} queued Signal event(s) across {} startup batch(es) after seeding",
+        discarded_event_count,
+        discarded_batch_count,
     )
 
 

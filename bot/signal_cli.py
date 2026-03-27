@@ -187,6 +187,14 @@ class SignalClient(abc.ABC):
     async def receive_events(self) -> list[SignalPayload]:
         raise NotImplementedError
 
+    async def close(self) -> None:
+        """
+        Close any resources held by the Signal client.
+
+        Returns: None
+        """
+        return None
+
     async def group_members(self, group_id: str) -> list[GroupMember]:
         groups = await self.list_groups()
         for group in groups:
@@ -397,6 +405,35 @@ class SignalRpcClient(SignalClient):
                 events.append(self._event_queue.get_nowait())
             except asyncio.QueueEmpty:
                 return events
+
+    async def close(self) -> None:
+        """
+        Close the daemon socket connection and background read task.
+
+        Returns: None
+        """
+        read_task = self._read_task
+        self._read_task = None
+        if read_task is not None:
+            read_task.cancel()
+            try:
+                await read_task
+            except asyncio.CancelledError:
+                pass
+            except SignalCliError:
+                pass
+
+        writer = self._writer
+        self._writer = None
+        self._reader = None
+        if writer is not None:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except OSError:
+                pass
+
+        self._fail_pending("signal-cli client closed")
 
     async def _ensure_connected(self) -> None:
         if self._writer is not None and not self._writer.is_closing():
