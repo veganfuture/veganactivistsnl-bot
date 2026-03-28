@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 import re
+from typing import Iterable
 
 from loguru import logger
 from pydantic import BaseModel, Field
@@ -32,18 +33,14 @@ class BotConfig:
     signal_receive_timeout_seconds: int
     signal_daemon_socket_path: Path
     group_cache_ttl_seconds: float
-    contacts_cache_ttl_seconds: float
     unresolved_name_retry_delay_seconds: float
 
 
 @dataclass
 class BotRuntime:
     group_cache_ttl_seconds: float
-    contacts_cache_ttl_seconds: float
     cached_welcome_group: SignalGroup | None = None
     cached_welcome_group_fetched_at: float | None = None
-    cached_contacts_by_id: dict[str, ContactRecipient] | None = None
-    cached_contacts_fetched_at: float | None = None
 
 
 class BotState(BaseModel):
@@ -78,7 +75,6 @@ async def _run(config: BotConfig) -> None:
     )
     runtime = BotRuntime(
         group_cache_ttl_seconds=config.group_cache_ttl_seconds,
-        contacts_cache_ttl_seconds=config.contacts_cache_ttl_seconds,
     )
     try:
         if config.sync_on_startup:
@@ -95,6 +91,7 @@ async def _run(config: BotConfig) -> None:
             logger.info("Bot state seeded")
             await _discard_startup_backlog(client)
 
+        i = 0
         while True:
             try:
                 payloads = await client.receive_events()
@@ -131,6 +128,9 @@ async def _run(config: BotConfig) -> None:
                 )
             except RuntimeError as exc:
                 logger.error("Error flushing pending welcomes: {}", exc)
+            if i % 10 == 0:
+                logger.debug("Bot idling")
+            i += 1
     finally:
         await client.close()
         logger.info("Shutting down bot")
@@ -182,6 +182,20 @@ async def _greet_new_welcome_group_members(
     welcome_message_min_interval_seconds: int,
     unresolved_name_retry_delay_seconds: float,
 ) -> None:
+    """
+    Update welcome-group membership state and greet newly joined members.
+
+    Args:
+    - client - Signal client used by the bot
+    - runtime - in-memory caches shared by the bot loop
+    - state - persisted bot state
+    - state_path - path to the state file
+    - welcome_message - welcome message template
+    - welcome_message_min_interval_seconds - minimum delay between greetings
+    - unresolved_name_retry_delay_seconds - retry delay for recipient-scoped contact lookups
+
+    Returns: None
+    """
     # Get group info
     group_id = state.welcome_group_id
     group = await _get_welcome_group(
@@ -202,6 +216,7 @@ async def _greet_new_welcome_group_members(
         _save_state(state, state_path)
         return
 
+    # Update state based on members coming or going
     new_members = members - known_members
     removed_members = known_members - members
     pending_members = {str(member_id) for member_id in state.pending_welcome_members}
@@ -216,7 +231,7 @@ async def _greet_new_welcome_group_members(
     )
     contacts_by_id: dict[str, ContactRecipient] = {}
     if removed_members:
-        contacts_by_id = await _get_contacts_by_id(client, runtime)
+        contacts_by_id = await _get_contacts_by_id(client, sorted(removed_members))
     if removed_members:
         pending_members -= removed_members
         removed_member_names = [
@@ -244,6 +259,8 @@ async def _greet_new_welcome_group_members(
     if not new_members:
         return
 
+    # Can we send a welcome message already or do we need to wait to maintain
+    # welcome_message_min_interval_seconds?
     now = time.time()
     duration_till_welcome_msg = _duration_till_welcome_msg(
         state.last_welcome_sent_at,
@@ -256,6 +273,7 @@ async def _greet_new_welcome_group_members(
         )
         return
 
+    # Send!
     await _send_welcome_messages(
         client,
         runtime,
@@ -307,6 +325,20 @@ async def _flush_pending_welcome_messages(
     welcome_message_min_interval_seconds: int,
     unresolved_name_retry_delay_seconds: float,
 ) -> None:
+    """
+    Send queued welcome messages once the rate-limit window has elapsed.
+
+    Args:
+    - client - Signal client used by the bot
+    - runtime - in-memory caches shared by the bot loop
+    - state - persisted bot state
+    - state_path - path to the state file
+    - welcome_message - welcome message template
+    - welcome_message_min_interval_seconds - minimum delay between greetings
+    - unresolved_name_retry_delay_seconds - retry delay for recipient-scoped contact lookups
+
+    Returns: None
+    """
     pending_members = {str(member_id) for member_id in state.pending_welcome_members}
     if not pending_members:
         return
@@ -352,7 +384,7 @@ async def _send_welcome_messages(
 
     This function handles the two most stateful pieces of logic in the bot:
     validating that pending members are still in the group, and retrying name
-    resolution after a sync when Signal initially does not expose user names.
+    resolution once when Signal initially does not expose user names.
 
     Args:
     - client - Signal client used by the bot
@@ -389,8 +421,9 @@ async def _send_welcome_messages(
         return
 
     # Resolve names of pending members
-    contacts_by_id = await _get_contacts_by_id(client, runtime)
     group_members = group.members
+    recipient_ids = _member_recipient_ids(group_members, new_members)
+    contacts_by_id = await _get_contacts_by_id(client, recipient_ids)
     pending_member_names = [
         _render_member_name(member, contacts_by_id)
         for member in group_members
@@ -401,28 +434,11 @@ async def _send_welcome_messages(
     ):
         _log_unresolved_members(group_members, new_members, contacts_by_id)
         logger.info(
-            "Retrying unresolved member names for group {} after sync",
+            "Retrying unresolved member names for group {} after delay",
             state.welcome_group_id,
         )
-        await client.send_sync_request()
-        runtime.cached_contacts_by_id = None
-        runtime.cached_contacts_fetched_at = None
-        runtime.cached_welcome_group = None
-        runtime.cached_welcome_group_fetched_at = None
         await asyncio.sleep(unresolved_name_retry_delay_seconds)
-        refreshed_group = await _get_welcome_group(
-            client,
-            runtime,
-            state.welcome_group_id,
-            force_refresh=True,
-        )
-        if refreshed_group is not None:
-            group = refreshed_group
-            current_member_ids = group.get_member_ids()
-            new_members &= current_member_ids
-            state.welcome_group_members = sorted(current_member_ids)
-            group_members = group.members
-        contacts_by_id = await _get_contacts_by_id(client, runtime)
+        contacts_by_id = await _get_contacts_by_id(client, recipient_ids)
         pending_member_names = [
             _render_member_name(member, contacts_by_id)
             for member in group_members
@@ -467,16 +483,6 @@ def _log_unresolved_members(
     new_members: set[str],
     contacts_by_id: dict[str, ContactRecipient],
 ) -> None:
-    """
-    Log the available fields for members whose names could not be resolved.
-
-    Args:
-    - group_members - current welcome group members
-    - new_members - ids of members to mention
-    - contacts_by_id - lookup of contacts by Signal recipient id
-
-    Returns: None
-    """
     for member in group_members:
         member_id = member.uuid or member.number
         if member_id is None or member_id not in new_members:
@@ -541,35 +547,53 @@ async def _get_welcome_group(
 
 async def _get_contacts_by_id(
     client: SignalClient,
-    runtime: BotRuntime,
+    recipients: Iterable[str],
 ) -> dict[str, ContactRecipient]:
     """
-    Fetch contacts and build a cached lookup.
+    Fetch contacts for specific recipients and build a lookup.
 
     Args:
     - client - Signal client used by the bot
-    - runtime - in-memory runtime caches
+    - recipients - recipient ids to request from Signal
 
     Returns: mapping from uuid or number to contact
     """
-    now = time.time()
-    if (
-        runtime.cached_contacts_by_id is not None
-        and runtime.cached_contacts_fetched_at is not None
-        and now - runtime.cached_contacts_fetched_at
-        <= runtime.contacts_cache_ttl_seconds
-    ):
-        return runtime.cached_contacts_by_id
-
+    unique_recipients = list(
+        dict.fromkeys(recipient for recipient in recipients if recipient)
+    )
     contacts_by_id: dict[str, ContactRecipient] = {}
-    for contact in await client.list_contacts():
+    if not unique_recipients:
+        return contacts_by_id
+    _merge_contacts_by_id(contacts_by_id, await client.list_contacts(unique_recipients))
+    return contacts_by_id
+
+
+def _member_recipient_ids(
+    group_members: list[GroupMember],
+    new_members: set[str],
+) -> list[str]:
+    return list(
+        dict.fromkeys(
+            recipient_id
+            for recipient_id in (
+                _resolve_member_recipient(member)
+                for member in group_members
+                if (member.uuid or member.number) in new_members
+            )
+            if recipient_id is not None
+        )
+    )
+
+
+def _merge_contacts_by_id(
+    contacts_by_id: dict[str, ContactRecipient],
+    contacts: list[ContactRecipient],
+) -> None:
+    for contact in contacts:
         if contact.uuid:
             contacts_by_id[contact.uuid] = contact
         if contact.number:
             contacts_by_id[contact.number] = contact
-    runtime.cached_contacts_by_id = contacts_by_id
-    runtime.cached_contacts_fetched_at = now
-    return contacts_by_id
 
 
 def _duration_till_welcome_msg(
@@ -607,6 +631,22 @@ def _render_member_name(
         return username
     if contact and contact.name and not _looks_like_phone_number(contact.name):
         return contact.name
+    return None
+
+
+def _resolve_member_recipient(member: GroupMember) -> str | None:
+    if member.uuid:
+        return member.uuid
+    if member.number:
+        return member.number
+    if member.username:
+        normalized = member.username.strip()
+        if normalized:
+            if normalized.startswith("u:"):
+                return normalized
+            if normalized.startswith("@"):
+                return f"u:{normalized[1:]}"
+            return f"u:{normalized}"
     return None
 
 
