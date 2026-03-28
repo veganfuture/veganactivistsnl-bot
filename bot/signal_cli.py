@@ -552,7 +552,7 @@ def _parse_groups_from_object(data: object) -> list[SignalGroup]:
 def normalize_member_set(members: Iterable[GroupMember]) -> set[str]:
     result = set()
     for member in members:
-        member_id = member.uuid or member.number
+        member_id = member.uuid or member.number or member.username
         if member_id is None:
             continue
         result.add(member_id)

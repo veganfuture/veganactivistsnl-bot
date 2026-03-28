@@ -10,7 +10,13 @@ from typing import Iterable
 from loguru import logger
 from pydantic import BaseModel, Field
 
-from bot.signal_cli import ContactRecipient, GroupMember, SignalGroup, SignalClient, create_signal_client
+from bot.signal_cli import (
+    ContactRecipient,
+    GroupMember,
+    SignalGroup,
+    SignalClient,
+    create_signal_client,
+)
 
 
 @dataclass
@@ -400,7 +406,7 @@ class Bot:
         pending_member_names = [
             _render_member_name(member, contacts_by_id)
             for member in group_members
-            if (member.uuid or member.number) in new_members
+            if _member_id(member) in new_members
         ]
         unresolved_names_present = any(
             candidate is None for candidate in pending_member_names
@@ -415,7 +421,7 @@ class Bot:
                 pending_member_names = [
                     _render_member_name(member, contacts_by_id)
                     for member in group_members
-                    if (member.uuid or member.number) in new_members
+                    if _member_id(member) in new_members
                 ]
                 unresolved_names_present = any(
                     candidate is None for candidate in pending_member_names
@@ -510,7 +516,9 @@ class Bot:
             )
             if not unique_recipients:
                 return contacts_by_id
-        _merge_contacts_by_id(contacts_by_id, await self.client.list_contacts(unique_recipients))
+        _merge_contacts_by_id(
+            contacts_by_id, await self.client.list_contacts(unique_recipients)
+        )
         return contacts_by_id
 
 
@@ -520,7 +528,7 @@ def _log_unresolved_members(
     contacts_by_id: dict[str, ContactRecipient],
 ) -> None:
     for member in group_members:
-        member_id = member.uuid or member.number
+        member_id = _member_id(member)
         if member_id is None or member_id not in new_members:
             continue
         rendered_name = _render_member_name(member, contacts_by_id)
@@ -556,7 +564,7 @@ def _member_recipient_ids(
             for recipient_id in (
                 _resolve_member_recipient(member)
                 for member in group_members
-                if (member.uuid or member.number) in new_members
+                if _member_id(member) in new_members
             )
             if recipient_id is not None
         )
@@ -593,7 +601,7 @@ def _render_member_name(
     member: GroupMember,
     contacts_by_id: dict[str, ContactRecipient],
 ) -> str | None:
-    member_id = member.uuid or member.number
+    member_id = _member_id(member)
     contact = contacts_by_id.get(member_id) if member_id else None
 
     contact_name = _preferred_contact_name(contact)
@@ -628,18 +636,8 @@ def _resolve_member_recipient(member: GroupMember) -> str | None:
     return None
 
 
-def _render_member_name_by_id(
-    member_id: str,
-    contacts_by_id: dict[str, ContactRecipient],
-) -> str | None:
-    contact = contacts_by_id.get(member_id)
-    contact_name = _preferred_contact_name(contact)
-    if contact_name is not None:
-        return contact_name
-    username = _normalize_username(contact.username if contact else None)
-    if username is not None:
-        return username
-    return None
+def _member_id(member: GroupMember) -> str | None:
+    return member.uuid or member.number or member.username
 
 
 def _preferred_contact_name(contact: ContactRecipient | None) -> str | None:
