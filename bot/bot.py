@@ -10,20 +10,7 @@ from typing import Iterable
 from loguru import logger
 from pydantic import BaseModel, Field
 
-from bot.signal_cli import (
-    ContactRecipient,
-    GroupMember,
-    SignalGroup,
-    SignalClient,
-    SignalPayload,
-    create_signal_client,
-)
-
-
-@dataclass
-class RecentSenderName:
-    name: str
-    observed_at: float
+from bot.signal_cli import ContactRecipient, GroupMember, SignalGroup, SignalClient, create_signal_client
 
 
 @dataclass
@@ -38,18 +25,8 @@ class BotConfig:
     signal_cli_timeout_seconds: float
     signal_receive_timeout_seconds: int
     signal_daemon_socket_path: Path
-    group_cache_ttl_seconds: float
-    recent_sender_name_ttl_seconds: float
     unresolved_name_retry_delay_seconds: float
-
-
-@dataclass
-class BotRuntime:
-    group_cache_ttl_seconds: float
-    recent_sender_name_ttl_seconds: float
-    cached_welcome_group: SignalGroup | None = None
-    cached_welcome_group_fetched_at: float | None = None
-    recent_sender_names_by_id: dict[str, RecentSenderName] | None = None
+    periodic_membership_reconcile_cycles: int
 
 
 class BotState(BaseModel):
@@ -65,7 +42,7 @@ class BotState(BaseModel):
 
 def run_bot(config: BotConfig) -> None:
     try:
-        asyncio.run(_run(config))
+        asyncio.run(Bot(config).run())
     except KeyboardInterrupt:
         pass
     except Exception:
@@ -73,474 +50,483 @@ def run_bot(config: BotConfig) -> None:
         raise
 
 
-async def _run(config: BotConfig) -> None:
-    logger.info("Starting signal bot for account {}", config.account)
-    logger.info("Bot config: {}", config)
+class Bot:
+    def __init__(
+        self,
+        config: BotConfig,
+        client: SignalClient | None = None,
+    ) -> None:
+        self.config = config
+        self.client = client or create_signal_client(
+            account=config.account,
+            command_timeout_seconds=config.signal_cli_timeout_seconds,
+            receive_timeout_seconds=config.signal_receive_timeout_seconds,
+            daemon_socket_path=config.signal_daemon_socket_path,
+        )
+        self.state: BotState | None = None
 
-    client = create_signal_client(
-        account=config.account,
-        command_timeout_seconds=config.signal_cli_timeout_seconds,
-        receive_timeout_seconds=config.signal_receive_timeout_seconds,
-        daemon_socket_path=config.signal_daemon_socket_path,
-    )
-    runtime = BotRuntime(
-        group_cache_ttl_seconds=config.group_cache_ttl_seconds,
-        recent_sender_name_ttl_seconds=config.recent_sender_name_ttl_seconds,
-        recent_sender_names_by_id={},
-    )
-    try:
-        if config.sync_on_startup:
-            logger.info("Requesting Signal sync on startup")
-            await client.send_sync_request()
+    async def run(self) -> None:
+        """
+        Run the bot event loop until shutdown or failure.
 
-        state = _load_state(config.state_path, config.state_max_age_seconds)
-        if state:
-            logger.info(f"Bot state loaded from: {config.state_path}")
-        if not state:
-            logger.info("No bot state found, seeding")
-            state = await _seed_state(client, config.welcome_group)
-            _save_state(state, config.state_path)
-            logger.info("Bot state seeded")
-            await _discard_startup_backlog(client)
+        Returns: None
+        """
+        logger.info("Starting signal bot for account {}", self.config.account)
+        logger.info("Bot config: {}", self.config)
 
-        i = 0
-        while True:
-            try:
-                payloads = await client.receive_events()
-            except Exception:
-                logger.exception("Failed while receiving Signal events")
-                raise
-            for payload in payloads:
-                _remember_recent_sender_name(runtime, payload)
-                logger.debug(payload)
-                if (
-                    payload.is_group_update()
-                    and payload.extract_group_id() == state.welcome_group_id
-                ):
-                    try:
-                        await _greet_new_welcome_group_members(
-                            client,
-                            runtime,
-                            state,
-                            config.state_path,
-                            config.welcome_message,
-                            config.welcome_message_min_interval_seconds,
-                            config.unresolved_name_retry_delay_seconds,
-                        )
-                    except RuntimeError as exc:
-                        logger.error("Error handling group update: {}", exc)
-            try:
-                await _flush_pending_welcome_messages(
-                    client,
-                    runtime,
-                    state,
-                    config.state_path,
-                    config.welcome_message,
-                    config.welcome_message_min_interval_seconds,
-                    config.unresolved_name_retry_delay_seconds,
+        try:
+            if self.config.sync_on_startup:
+                logger.info("Requesting Signal sync on startup")
+                await self.client.send_sync_request()
+
+            self.state = self.load_state()
+            if self.state:
+                logger.info(f"Bot state loaded from: {self.config.state_path}")
+            if not self.state:
+                logger.info("No bot state found, seeding")
+                self.state = await self.seed_state()
+                self.save_state()
+                logger.info("Bot state seeded")
+                await self.discard_startup_backlog()
+
+            i = 0
+            while True:
+                try:
+                    payloads = await self.client.receive_events()
+                except Exception:
+                    logger.exception("Failed while receiving Signal events")
+                    raise
+                should_reconcile_membership = (
+                    self.config.periodic_membership_reconcile_cycles > 0
+                    and i % self.config.periodic_membership_reconcile_cycles == 0
                 )
-            except RuntimeError as exc:
-                logger.error("Error flushing pending welcomes: {}", exc)
-            if i % 10 == 0:
-                logger.debug("Bot idling")
-            i += 1
-    finally:
-        await client.close()
-        logger.info("Shutting down bot")
+                state = self.require_state()
+                for payload in payloads:
+                    logger.debug(payload)
+                    if (
+                        payload.is_group_update()
+                        and payload.extract_group_id() == state.welcome_group_id
+                    ):
+                        should_reconcile_membership = False
+                        try:
+                            await self.greet_new_welcome_group_members()
+                        except RuntimeError as exc:
+                            logger.error("Error handling group update: {}", exc)
+                if should_reconcile_membership:
+                    try:
+                        await self.greet_new_welcome_group_members()
+                    except RuntimeError as exc:
+                        logger.error(
+                            "Error reconciling welcome group membership: {}",
+                            exc,
+                        )
+                try:
+                    await self.flush_pending_welcome_messages()
+                except RuntimeError as exc:
+                    logger.error("Error flushing pending welcomes: {}", exc)
+                if i % 10 == 0:
+                    logger.debug("Bot idling")
+                i += 1
+        finally:
+            await self.client.close()
+            logger.info("Shutting down bot")
 
+    def require_state(self) -> BotState:
+        """
+        Return the initialized bot state.
 
-async def _seed_state(client: SignalClient, welcome_group: str) -> BotState:
-    group = await client.get_group_by_name(welcome_group)
+        Returns: current bot state
+        """
+        if self.state is None:
+            raise RuntimeError("Bot state has not been initialized")
+        return self.state
 
-    if group is None:
-        groups = await client.list_groups()
-        group_names = [group.name for group in groups]
-        raise RuntimeError(
-            f"Could not find listing for group: {welcome_group}. Groups found: {group_names}"
-        )
+    def load_state(self) -> BotState | None:
+        """
+        Load persisted bot state if it exists and is still fresh enough.
 
-    if group.resolved_id is None:
-        raise RuntimeError(f"Could not resolve group_id for group: {welcome_group}")
+        Returns: loaded bot state, or None when reseeding is required
+        """
+        if not self.config.state_path.exists():
+            return None
+        age_seconds = time.time() - self.config.state_path.stat().st_mtime
+        if age_seconds > self.config.state_max_age_seconds:
+            logger.info("State file is stale ({}s), reseeding", int(age_seconds))
+            return None
 
-    return BotState(
-        welcome_group_id=group.resolved_id,
-        welcome_group_members=sorted(group.get_member_ids()),
-        pending_welcome_members=[],
-        last_welcome_sent_at=None,
-        pending_name_retry_at=None,
-    )
+        return BotState.model_validate_json(self.config.state_path.read_text())
 
+    def save_state(self) -> None:
+        """
+        Persist the current bot state to disk.
 
-async def _discard_startup_backlog(client: SignalClient) -> None:
-    discarded_event_count = 0
-    discarded_batch_count = 0
-    while True:
-        payloads = await client.receive_events()
-        if not payloads:
-            break
-        discarded_batch_count += 1
-        discarded_event_count += len(payloads)
-    logger.info(
-        "Discarded {} queued Signal event(s) across {} startup batch(es) after seeding",
-        discarded_event_count,
-        discarded_batch_count,
-    )
-
-
-async def _greet_new_welcome_group_members(
-    client: SignalClient,
-    runtime: BotRuntime,
-    state: BotState,
-    state_path: Path,
-    welcome_message: str,
-    welcome_message_min_interval_seconds: int,
-    unresolved_name_retry_delay_seconds: float,
-) -> None:
-    """
-    Update welcome-group membership state and greet newly joined members.
-
-    Args:
-    - client - Signal client used by the bot
-    - runtime - in-memory caches shared by the bot loop
-    - state - persisted bot state
-    - state_path - path to the state file
-    - welcome_message - welcome message template
-    - welcome_message_min_interval_seconds - minimum delay between greetings
-    - unresolved_name_retry_delay_seconds - retry delay for recipient-scoped contact lookups
-
-    Returns: None
-    """
-    # Get group info
-    group_id = state.welcome_group_id
-    group = await _get_welcome_group(
-        client,
-        runtime,
-        state.welcome_group_id,
-        force_refresh=True,
-    )
-    if group is None:
-        logger.error(f"Could not resolve group info for welcome group!")
-        return
-
-    # Check whether we have new members
-    members = group.get_member_ids()
-    known_members = {str(member_id) for member_id in state.welcome_group_members}
-    if not known_members:
-        state.welcome_group_members = sorted(members)
-        _save_state(state, state_path)
-        return
-
-    # Update state based on members coming or going
-    new_members = members - known_members
-    removed_members = known_members - members
-    pending_members = {str(member_id) for member_id in state.pending_welcome_members}
-    logger.debug(
-        "Group {} membership diff: known={}, current={}, new={}, removed={}, pending={}",
-        group_id,
-        len(known_members),
-        len(members),
-        len(new_members),
-        len(removed_members),
-        len(pending_members),
-    )
-    contacts_by_id: dict[str, ContactRecipient] = {}
-    if removed_members:
-        contacts_by_id = await _get_contacts_by_id(client, sorted(removed_members))
-    if removed_members:
-        pending_members -= removed_members
-        removed_member_names = [
-            _render_member_name_by_id(member_id, contacts_by_id, runtime)
-            for member_id in sorted(removed_members)
-        ]
-        resolved_removed_member_names = [
-            name for name in removed_member_names if name is not None
-        ]
-        logger.info(
-            "Members left group {}: {}",
-            group_id,
-            ", ".join(resolved_removed_member_names)
-            if resolved_removed_member_names
-            else (
-                "an unnamed member" if len(removed_members) == 1 else "unnamed members"
+        Returns: None
+        """
+        self.config.state_path.parent.mkdir(parents=True, exist_ok=True)
+        state = self.require_state()
+        encoded = BotState(
+            welcome_group_id=state.welcome_group_id,
+            welcome_group_members=sorted(
+                {str(member) for member in state.welcome_group_members}
             ),
+            pending_welcome_members=sorted(
+                {str(member) for member in state.pending_welcome_members}
+            ),
+            last_welcome_sent_at=state.last_welcome_sent_at,
+            pending_name_retry_at=state.pending_name_retry_at,
         )
-    if new_members:
-        pending_members |= new_members
-    state.welcome_group_members = sorted(members)
-    state.pending_welcome_members = sorted(pending_members)
-    if not pending_members:
-        state.pending_name_retry_at = None
-    _save_state(state, state_path)
+        self.config.state_path.write_text(encoded.model_dump_json(indent=2))
 
-    if not new_members:
-        return
+    async def seed_state(self) -> BotState:
+        """
+        Build initial bot state from the configured welcome group membership.
 
-    # Can we send a welcome message already or do we need to wait to maintain
-    # welcome_message_min_interval_seconds?
-    now = time.time()
-    duration_till_welcome_msg = _duration_till_welcome_msg(
-        state.last_welcome_sent_at,
-        now,
-        welcome_message_min_interval_seconds,
-    )
-    if duration_till_welcome_msg is not None:
-        logger.info(
-            f"{len(pending_members)} pending members queued for another {duration_till_welcome_msg:.0f} seconds"
-        )
-        return
+        Returns: freshly seeded bot state
+        """
+        group = await self.client.get_group_by_name(self.config.welcome_group)
 
-    if (
-        state.pending_name_retry_at is not None
-        and now < state.pending_name_retry_at
-    ):
-        logger.debug(
-            "Pending member-name retry for group {} in another {:.0f} seconds",
-            state.welcome_group_id,
-            state.pending_name_retry_at - now,
-        )
-        return
-
-    # Send!
-    await _send_welcome_messages(
-        client,
-        runtime,
-        state,
-        state_path,
-        welcome_message,
-        pending_members,
-        now,
-        group,
-        unresolved_name_retry_delay_seconds,
-    )
-
-
-def _save_state(state: BotState, state_path: Path) -> None:
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    encoded = BotState(
-        welcome_group_id=state.welcome_group_id,
-        welcome_group_members=sorted(
-            {str(member) for member in state.welcome_group_members}
-        ),
-        pending_welcome_members=sorted(
-            {str(member) for member in state.pending_welcome_members}
-        ),
-        last_welcome_sent_at=state.last_welcome_sent_at,
-        pending_name_retry_at=state.pending_name_retry_at,
-    )
-    state_path.write_text(encoded.model_dump_json(indent=2))
-
-
-def _load_state(
-    state_path: Path,
-    state_max_age_seconds: int,
-) -> BotState | None:
-    if not state_path.exists():
-        return None
-    age_seconds = time.time() - state_path.stat().st_mtime
-    if age_seconds > state_max_age_seconds:
-        logger.info("State file is stale ({}s), reseeding", int(age_seconds))
-        return None
-
-    return BotState.model_validate_json(state_path.read_text())
-
-
-async def _flush_pending_welcome_messages(
-    client: SignalClient,
-    runtime: BotRuntime,
-    state: BotState,
-    state_path: Path,
-    welcome_message: str,
-    welcome_message_min_interval_seconds: int,
-    unresolved_name_retry_delay_seconds: float,
-) -> None:
-    """
-    Send queued welcome messages once the rate-limit window has elapsed.
-
-    Args:
-    - client - Signal client used by the bot
-    - runtime - in-memory caches shared by the bot loop
-    - state - persisted bot state
-    - state_path - path to the state file
-    - welcome_message - welcome message template
-    - welcome_message_min_interval_seconds - minimum delay between greetings
-    - unresolved_name_retry_delay_seconds - retry delay for recipient-scoped contact lookups
-
-    Returns: None
-    """
-    pending_members = {str(member_id) for member_id in state.pending_welcome_members}
-    if not pending_members:
-        return
-
-    now = time.time()
-    duration_till_welcome_msg = _duration_till_welcome_msg(
-        state.last_welcome_sent_at,
-        now,
-        welcome_message_min_interval_seconds,
-    )
-    if duration_till_welcome_msg is not None:
-        logger.debug(
-            f"{len(pending_members)} pending members queued for another {duration_till_welcome_msg:.0f} seconds"
-        )
-        return
-
-    if (
-        state.pending_name_retry_at is not None
-        and now < state.pending_name_retry_at
-    ):
-        logger.debug(
-            "Pending member-name retry for group {} in another {:.0f} seconds",
-            state.welcome_group_id,
-            state.pending_name_retry_at - now,
-        )
-        return
-
-    await _send_welcome_messages(
-        client,
-        runtime,
-        state,
-        state_path,
-        welcome_message,
-        pending_members,
-        now,
-        None,
-        unresolved_name_retry_delay_seconds,
-    )
-
-
-async def _send_welcome_messages(
-    client: SignalClient,
-    runtime: BotRuntime,
-    state: BotState,
-    state_path: Path,
-    welcome_message: str,
-    new_members: set[str],
-    now: float,
-    group: SignalGroup | None,
-    unresolved_name_retry_delay_seconds: float = 0.0,
-) -> None:
-    """
-    Send the welcome message once pending members are stable enough to greet.
-
-    This function handles the two most stateful pieces of logic in the bot:
-    validating that pending members are still in the group, and retrying name
-    resolution once when Signal initially does not expose user names.
-
-    Args:
-    - client - Signal client used by the bot
-    - runtime - in-memory caches shared by the bot loop
-    - state - persisted bot state
-    - state_path - path to the state file
-    - welcome_message - welcome message template
-    - new_members - pending members to greet
-    - now - current timestamp
-    - group - optional already-fetched group snapshot
-    - unresolved_name_retry_delay_seconds - retry delay when names are unresolved
-
-    Returns: None
-    """
-    resolved_group = group
-    if resolved_group is None:
-        resolved_group = await _get_welcome_group(
-            client,
-            runtime,
-            state.welcome_group_id,
-            force_refresh=False,
-        )
-    group = resolved_group
-    if group is None:
-        logger.error("Could not resolve group info for pending welcomes!")
-        return
-
-    current_member_ids = group.get_member_ids()
-    new_members &= current_member_ids
-    state.welcome_group_members = sorted(current_member_ids)
-    if not new_members:
-        state.pending_welcome_members = []
-        _save_state(state, state_path)
-        return
-
-    # Resolve names of pending members
-    group_members = group.members
-    recipient_ids = _member_recipient_ids(group_members, new_members)
-    contacts_by_id = await _get_contacts_by_id(client, recipient_ids)
-    pending_member_names = [
-        _render_member_name(member, contacts_by_id, runtime)
-        for member in group_members
-        if (member.uuid or member.number) in new_members
-    ]
-    unresolved_names_present = any(
-        candidate is None for candidate in pending_member_names
-    )
-    if (
-        unresolved_names_present
-        and unresolved_name_retry_delay_seconds > 0
-        and state.pending_name_retry_at is None
-    ):
-        _log_unresolved_members(group_members, new_members, contacts_by_id, runtime)
-        logger.info(
-            "Deferring unresolved member-name retry for group {} by {:.0f} seconds",
-            state.welcome_group_id,
-            unresolved_name_retry_delay_seconds,
-        )
-        state.pending_name_retry_at = now + unresolved_name_retry_delay_seconds
-        _save_state(state, state_path)
-        return
-    if unresolved_names_present:
-        _log_unresolved_members(group_members, new_members, contacts_by_id, runtime)
-
-    # Prepare welcome message
-    if any(name is None for name in pending_member_names):
-        message = (
-            welcome_message.replace(" {{newusers}}", "")
-            .replace("{{newusers}} ", "")
-            .replace("{{newusers}}", "")
-        )
-    else:
-        resolved_names = [name for name in pending_member_names if name is not None]
-        if len(resolved_names) == 1:
-            rendered_names = resolved_names[0]
-        elif len(resolved_names) == 2:
-            rendered_names = f"{resolved_names[0]} and {resolved_names[1]}"
-        else:
-            rendered_names = (
-                f"{', '.join(resolved_names[:-1])} and {resolved_names[-1]}"
+        if group is None:
+            groups = await self.client.list_groups()
+            group_names = [group.name for group in groups]
+            raise RuntimeError(
+                f"Could not find listing for group: {self.config.welcome_group}. Groups found: {group_names}"
             )
-        message = welcome_message.replace("{{newusers}}", rendered_names)
 
-    # Send
-    await client.send_group_message(state.welcome_group_id, message)
-    state.pending_welcome_members = []
-    state.last_welcome_sent_at = now
-    state.pending_name_retry_at = None
-    _save_state(state, state_path)
-    logger.info(
-        "Sent welcome message to group {} for {} member(s)",
-        state.welcome_group_id,
-        len(new_members),
-    )
+        if group.resolved_id is None:
+            raise RuntimeError(
+                f"Could not resolve group_id for group: {self.config.welcome_group}"
+            )
+
+        return BotState(
+            welcome_group_id=group.resolved_id,
+            welcome_group_members=sorted(group.get_member_ids()),
+            pending_welcome_members=[],
+            last_welcome_sent_at=None,
+            pending_name_retry_at=None,
+        )
+
+    async def discard_startup_backlog(self) -> None:
+        """
+        Drain any queued Signal events after seeding initial state.
+
+        Returns: None
+        """
+        discarded_event_count = 0
+        discarded_batch_count = 0
+        while True:
+            payloads = await self.client.receive_events()
+            if not payloads:
+                break
+            discarded_batch_count += 1
+            discarded_event_count += len(payloads)
+        logger.info(
+            "Discarded {} queued Signal event(s) across {} startup batch(es) after seeding",
+            discarded_event_count,
+            discarded_batch_count,
+        )
+
+    async def greet_new_welcome_group_members(self) -> None:
+        """
+        Reconcile welcome-group membership and queue or send greetings for joins.
+
+        Returns: None
+        """
+        state = self.require_state()
+
+        group_id = state.welcome_group_id
+        group = await self.get_welcome_group(force_refresh=True)
+        if group is None:
+            logger.error("Could not resolve group info for welcome group!")
+            return
+
+        members = group.get_member_ids()
+        known_members = {str(member_id) for member_id in state.welcome_group_members}
+        if not known_members:
+            state.welcome_group_members = sorted(members)
+            self.save_state()
+            return
+
+        # Update membership state based on members coming or going.
+        new_members = members - known_members
+        removed_members = known_members - members
+        pending_members = {
+            str(member_id) for member_id in state.pending_welcome_members
+        }
+        logger.debug(
+            "Group {} membership diff: known={}, current={}, new={}, removed={}, pending={}",
+            group_id,
+            len(known_members),
+            len(members),
+            len(new_members),
+            len(removed_members),
+            len(pending_members),
+        )
+        if removed_members:
+            pending_members -= removed_members
+            logger.info(
+                "Members left group {}: {}",
+                group_id,
+                ", ".join(sorted(removed_members)),
+            )
+        if new_members:
+            pending_members |= new_members
+        state.welcome_group_members = sorted(members)
+        state.pending_welcome_members = sorted(pending_members)
+        if not pending_members:
+            state.pending_name_retry_at = None
+        self.save_state()
+
+        if not new_members:
+            return
+
+        # Respect welcome-message throttling and deferred name retries.
+        now = time.time()
+        duration_till_welcome_msg = _duration_till_welcome_msg(
+            state.last_welcome_sent_at,
+            now,
+            self.config.welcome_message_min_interval_seconds,
+        )
+        if duration_till_welcome_msg is not None:
+            logger.info(
+                f"{len(pending_members)} pending members queued for another {duration_till_welcome_msg:.0f} seconds"
+            )
+            return
+
+        if (
+            state.pending_name_retry_at is not None
+            and now < state.pending_name_retry_at
+        ):
+            logger.debug(
+                "Pending member-name retry for group {} in another {:.0f} seconds",
+                state.welcome_group_id,
+                state.pending_name_retry_at - now,
+            )
+            return
+
+        await self.send_welcome_messages(
+            pending_members,
+            now,
+            group,
+            self.config.unresolved_name_retry_delay_seconds,
+        )
+
+    async def flush_pending_welcome_messages(self) -> None:
+        """
+        Send queued welcome messages once any wait windows have elapsed.
+
+        Returns: None
+        """
+        state = self.require_state()
+        pending_members = {
+            str(member_id) for member_id in state.pending_welcome_members
+        }
+        if not pending_members:
+            return
+
+        now = time.time()
+        duration_till_welcome_msg = _duration_till_welcome_msg(
+            state.last_welcome_sent_at,
+            now,
+            self.config.welcome_message_min_interval_seconds,
+        )
+        if duration_till_welcome_msg is not None:
+            logger.debug(
+                f"{len(pending_members)} pending members queued for another {duration_till_welcome_msg:.0f} seconds"
+            )
+            return
+
+        if (
+            state.pending_name_retry_at is not None
+            and now < state.pending_name_retry_at
+        ):
+            logger.debug(
+                "Pending member-name retry for group {} in another {:.0f} seconds",
+                state.welcome_group_id,
+                state.pending_name_retry_at - now,
+            )
+            return
+
+        await self.send_welcome_messages(
+            pending_members,
+            now,
+            None,
+            self.config.unresolved_name_retry_delay_seconds,
+        )
+
+    async def send_welcome_messages(
+        self,
+        new_members: set[str],
+        now: float,
+        group: SignalGroup | None,
+        unresolved_name_retry_delay_seconds: float = 0.0,
+    ) -> None:
+        """
+        Send the welcome message once pending members are stable enough to greet.
+
+        Args:
+        - new_members - pending member ids to greet
+        - now - current timestamp
+        - group - optional already-fetched group snapshot
+        - unresolved_name_retry_delay_seconds - retry delay when names are unresolved
+
+        Returns: None
+        """
+        state = self.require_state()
+        resolved_group = group
+        if resolved_group is None:
+            resolved_group = await self.get_welcome_group(force_refresh=False)
+        group = resolved_group
+        if group is None:
+            logger.error("Could not resolve group info for pending welcomes!")
+            return
+
+        current_member_ids = group.get_member_ids()
+        new_members &= current_member_ids
+        state.welcome_group_members = sorted(current_member_ids)
+        if not new_members:
+            state.pending_welcome_members = []
+            self.save_state()
+            return
+
+        # Resolve names for the members we are about to mention in the message.
+        group_members = group.members
+        recipient_ids = _member_recipient_ids(group_members, new_members)
+        contacts_by_id = await self.get_contacts_by_id()
+        pending_member_names = [
+            _render_member_name(member, contacts_by_id)
+            for member in group_members
+            if (member.uuid or member.number) in new_members
+        ]
+        unresolved_names_present = any(
+            candidate is None for candidate in pending_member_names
+        )
+        if unresolved_names_present:
+            scoped_contacts_by_id = await self.get_contacts_by_id(recipient_ids)
+            if scoped_contacts_by_id:
+                _merge_contacts_by_id(
+                    contacts_by_id,
+                    list(scoped_contacts_by_id.values()),
+                )
+                pending_member_names = [
+                    _render_member_name(member, contacts_by_id)
+                    for member in group_members
+                    if (member.uuid or member.number) in new_members
+                ]
+                unresolved_names_present = any(
+                    candidate is None for candidate in pending_member_names
+                )
+        if (
+            unresolved_names_present
+            and unresolved_name_retry_delay_seconds > 0
+            and state.pending_name_retry_at is None
+        ):
+            _log_unresolved_members(
+                group_members,
+                new_members,
+                contacts_by_id,
+            )
+            logger.info(
+                "Deferring unresolved member-name retry for group {} by {:.0f} seconds",
+                state.welcome_group_id,
+                unresolved_name_retry_delay_seconds,
+            )
+            state.pending_name_retry_at = now + unresolved_name_retry_delay_seconds
+            self.save_state()
+            return
+        if unresolved_names_present:
+            _log_unresolved_members(
+                group_members,
+                new_members,
+                contacts_by_id,
+            )
+
+        # Render the welcome message with names when available.
+        if any(name is None for name in pending_member_names):
+            message = (
+                self.config.welcome_message.replace(" {{newusers}}", "")
+                .replace("{{newusers}} ", "")
+                .replace("{{newusers}}", "")
+            )
+        else:
+            resolved_names = [name for name in pending_member_names if name is not None]
+            if len(resolved_names) == 1:
+                rendered_names = resolved_names[0]
+            elif len(resolved_names) == 2:
+                rendered_names = f"{resolved_names[0]} and {resolved_names[1]}"
+            else:
+                rendered_names = (
+                    f"{', '.join(resolved_names[:-1])} and {resolved_names[-1]}"
+                )
+            message = self.config.welcome_message.replace(
+                "{{newusers}}",
+                rendered_names,
+            )
+
+        await self.client.send_group_message(state.welcome_group_id, message)
+        state.pending_welcome_members = []
+        state.last_welcome_sent_at = now
+        state.pending_name_retry_at = None
+        self.save_state()
+        logger.info(
+            "Sent welcome message to group {} for {} member(s)",
+            state.welcome_group_id,
+            len(new_members),
+        )
+
+    async def get_welcome_group(self, force_refresh: bool) -> SignalGroup | None:
+        """
+        Fetch the configured welcome group.
+
+        Args:
+        - force_refresh - unused compatibility flag for callers that always need a fresh lookup
+
+        Returns: welcome group details, if found
+        """
+        state = self.require_state()
+        return await self.client.get_group_by_id(state.welcome_group_id)
+
+    async def get_contacts_by_id(
+        self,
+        recipients: Iterable[str] | None = None,
+    ) -> dict[str, ContactRecipient]:
+        """
+        Fetch contacts for specific recipients and build a lookup.
+
+        Args:
+        - recipients - optional recipient ids to request from Signal
+
+        Returns: mapping from uuid or number to contact
+        """
+        contacts_by_id: dict[str, ContactRecipient] = {}
+        unique_recipients: list[str] | None = None
+        if recipients is not None:
+            unique_recipients = list(
+                dict.fromkeys(recipient for recipient in recipients if recipient)
+            )
+            if not unique_recipients:
+                return contacts_by_id
+        _merge_contacts_by_id(contacts_by_id, await self.client.list_contacts(unique_recipients))
+        return contacts_by_id
 
 
 def _log_unresolved_members(
     group_members: list[GroupMember],
     new_members: set[str],
     contacts_by_id: dict[str, ContactRecipient],
-    runtime: BotRuntime,
 ) -> None:
     for member in group_members:
         member_id = member.uuid or member.number
         if member_id is None or member_id not in new_members:
             continue
-        rendered_name = _render_member_name(member, contacts_by_id, runtime)
+        rendered_name = _render_member_name(member, contacts_by_id)
         if rendered_name is not None:
             continue
         contact = contacts_by_id.get(member_id)
-        recent_sender_name = _recent_sender_name_for_member(runtime, member)
         logger.debug(
             "Could not resolve member name for id={} member.name={!r} member.username={!r} "
             "contact_present={} contact.name={!r} contact.username={!r} "
             "contact.profile.given={!r} contact.profile.family={!r} "
-            "contact.given={!r} contact.family={!r} contact.nick={!r} "
-            "recent_sender_name={!r}",
+            "contact.given={!r} contact.family={!r} contact.nick={!r}",
             member_id,
             member.name,
             member.username,
@@ -552,66 +538,7 @@ def _log_unresolved_members(
             contact.given_name if contact else None,
             contact.family_name if contact else None,
             contact.nick_name if contact else None,
-            recent_sender_name,
         )
-
-
-async def _get_welcome_group(
-    client: SignalClient,
-    runtime: BotRuntime,
-    welcome_group_id: str,
-    force_refresh: bool,
-) -> SignalGroup | None:
-    """
-    Fetch the welcome group, reusing a short-lived cache when safe.
-
-    Args:
-    - client - Signal client used by the bot
-    - runtime - in-memory runtime caches
-    - welcome_group_id - resolved Signal group id
-    - force_refresh - whether to bypass the cache
-
-    Returns: welcome group details, if found
-    """
-    now = time.time()
-    if (
-        not force_refresh
-        and runtime.cached_welcome_group is not None
-        and runtime.cached_welcome_group.resolved_id == welcome_group_id
-        and runtime.cached_welcome_group_fetched_at is not None
-        and now - runtime.cached_welcome_group_fetched_at
-        <= runtime.group_cache_ttl_seconds
-    ):
-        return runtime.cached_welcome_group
-
-    group = await client.get_group_by_id(welcome_group_id)
-    if group is not None:
-        runtime.cached_welcome_group = group
-        runtime.cached_welcome_group_fetched_at = now
-    return group
-
-
-async def _get_contacts_by_id(
-    client: SignalClient,
-    recipients: Iterable[str],
-) -> dict[str, ContactRecipient]:
-    """
-    Fetch contacts for specific recipients and build a lookup.
-
-    Args:
-    - client - Signal client used by the bot
-    - recipients - recipient ids to request from Signal
-
-    Returns: mapping from uuid or number to contact
-    """
-    unique_recipients = list(
-        dict.fromkeys(recipient for recipient in recipients if recipient)
-    )
-    contacts_by_id: dict[str, ContactRecipient] = {}
-    if not unique_recipients:
-        return contacts_by_id
-    _merge_contacts_by_id(contacts_by_id, await client.list_contacts(unique_recipients))
-    return contacts_by_id
 
 
 def _member_recipient_ids(
@@ -660,7 +587,6 @@ def _duration_till_welcome_msg(
 def _render_member_name(
     member: GroupMember,
     contacts_by_id: dict[str, ContactRecipient],
-    runtime: BotRuntime,
 ) -> str | None:
     member_id = member.uuid or member.number
     contact = contacts_by_id.get(member_id) if member_id else None
@@ -678,9 +604,6 @@ def _render_member_name(
         return username
     if contact and contact.name and not _looks_like_phone_number(contact.name):
         return contact.name
-    recent_sender_name = _recent_sender_name_for_member(runtime, member)
-    if recent_sender_name is not None:
-        return recent_sender_name
     return None
 
 
@@ -703,7 +626,6 @@ def _resolve_member_recipient(member: GroupMember) -> str | None:
 def _render_member_name_by_id(
     member_id: str,
     contacts_by_id: dict[str, ContactRecipient],
-    runtime: BotRuntime,
 ) -> str | None:
     contact = contacts_by_id.get(member_id)
     contact_name = _preferred_contact_name(contact)
@@ -712,62 +634,7 @@ def _render_member_name_by_id(
     username = _normalize_username(contact.username if contact else None)
     if username is not None:
         return username
-    recent_sender_name = _recent_sender_name_by_id(runtime, member_id)
-    if recent_sender_name is not None:
-        return recent_sender_name
     return None
-
-
-def _remember_recent_sender_name(runtime: BotRuntime, payload: SignalPayload) -> None:
-    sender_name = payload.sender_name()
-    if sender_name is None:
-        return
-    now = time.time()
-    _prune_recent_sender_names(runtime, now)
-    recent_sender_names = runtime.recent_sender_names_by_id
-    if recent_sender_names is None:
-        recent_sender_names = {}
-        runtime.recent_sender_names_by_id = recent_sender_names
-    for sender_id in payload.sender_ids():
-        recent_sender_names[sender_id] = RecentSenderName(sender_name, now)
-
-
-def _prune_recent_sender_names(runtime: BotRuntime, now: float) -> None:
-    recent_sender_names = runtime.recent_sender_names_by_id
-    if recent_sender_names is None:
-        return
-    expired_sender_ids = [
-        sender_id
-        for sender_id, recent_sender_name in recent_sender_names.items()
-        if now - recent_sender_name.observed_at > runtime.recent_sender_name_ttl_seconds
-    ]
-    for sender_id in expired_sender_ids:
-        del recent_sender_names[sender_id]
-
-
-def _recent_sender_name_for_member(
-    runtime: BotRuntime,
-    member: GroupMember,
-) -> str | None:
-    for member_id in [member.uuid, member.number, _resolve_member_recipient(member)]:
-        if member_id is None:
-            continue
-        recent_sender_name = _recent_sender_name_by_id(runtime, member_id)
-        if recent_sender_name is not None:
-            return recent_sender_name
-    return None
-
-
-def _recent_sender_name_by_id(runtime: BotRuntime, member_id: str) -> str | None:
-    now = time.time()
-    _prune_recent_sender_names(runtime, now)
-    recent_sender_names = runtime.recent_sender_names_by_id
-    if recent_sender_names is None:
-        return None
-    recent_sender_name = recent_sender_names.get(member_id)
-    if recent_sender_name is None:
-        return None
-    return recent_sender_name.name
 
 
 def _preferred_contact_name(contact: ContactRecipient | None) -> str | None:

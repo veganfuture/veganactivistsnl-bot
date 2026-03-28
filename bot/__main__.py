@@ -24,9 +24,8 @@ DEFAULT_SYNC_ON_STARTUP = True
 DEFAULT_SIGNAL_CLI_TIMEOUT_SECONDS = 30.0
 DEFAULT_SIGNAL_RECEIVE_TIMEOUT_SECONDS = 5
 DEFAULT_SIGNAL_DAEMON_SOCKET_PATH = "/srv/veganactivistsnl-bot/run/signal-cli.sock"
-DEFAULT_GROUP_CACHE_TTL_SECONDS = 2.0
-DEFAULT_RECENT_SENDER_NAME_TTL_SECONDS = 10.0
 DEFAULT_UNRESOLVED_NAME_RETRY_DELAY_SECONDS = 10.0
+DEFAULT_PERIODIC_MEMBERSHIP_RECONCILE_CYCLES = 6
 
 
 def main() -> None:
@@ -49,13 +48,13 @@ def main() -> None:
         raise ValueError("--signal-cli-timeout-seconds must be greater than zero")
     if args.signal_receive_timeout_seconds <= 0:
         raise ValueError("--signal-receive-timeout-seconds must be greater than zero")
-    if args.group_cache_ttl_seconds < 0:
-        raise ValueError("--group-cache-ttl-seconds must be zero or greater")
-    if args.recent_sender_name_ttl_seconds < 0:
-        raise ValueError("--recent-sender-name-ttl-seconds must be zero or greater")
     if args.unresolved_name_retry_delay_seconds < 0:
         raise ValueError(
             "--unresolved-name-retry-delay-seconds must be zero or greater"
+        )
+    if args.periodic_membership_reconcile_cycles < 0:
+        raise ValueError(
+            "--periodic-membership-reconcile-cycles must be zero or greater"
         )
     config = BotConfig(
         account=args.account,
@@ -68,9 +67,8 @@ def main() -> None:
         signal_cli_timeout_seconds=args.signal_cli_timeout_seconds,
         signal_receive_timeout_seconds=args.signal_receive_timeout_seconds,
         signal_daemon_socket_path=args.signal_daemon_socket_path,
-        group_cache_ttl_seconds=args.group_cache_ttl_seconds,
-        recent_sender_name_ttl_seconds=args.recent_sender_name_ttl_seconds,
         unresolved_name_retry_delay_seconds=args.unresolved_name_retry_delay_seconds,
+        periodic_membership_reconcile_cycles=args.periodic_membership_reconcile_cycles,
     )
     run_bot(config)
 
@@ -181,34 +179,6 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--group-cache-ttl-seconds",
-        type=float,
-        default=float(
-            os.environ.get(
-                "GROUP_CACHE_TTL_SECONDS",
-                DEFAULT_GROUP_CACHE_TTL_SECONDS,
-            )
-        ),
-        help=(
-            "Reuse the welcome group snapshot for this many seconds "
-            "(or set GROUP_CACHE_TTL_SECONDS)"
-        ),
-    )
-    parser.add_argument(
-        "--recent-sender-name-ttl-seconds",
-        type=float,
-        default=float(
-            os.environ.get(
-                "RECENT_SENDER_NAME_TTL_SECONDS",
-                DEFAULT_RECENT_SENDER_NAME_TTL_SECONDS,
-            )
-        ),
-        help=(
-            "Reuse sender names observed in recent Signal events for this many seconds "
-            "(or set RECENT_SENDER_NAME_TTL_SECONDS)"
-        ),
-    )
-    parser.add_argument(
         "--unresolved-name-retry-delay-seconds",
         type=float,
         default=float(
@@ -220,6 +190,20 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Wait this many seconds before retrying unresolved member names "
             "(or set UNRESOLVED_NAME_RETRY_DELAY_SECONDS)"
+        ),
+    )
+    parser.add_argument(
+        "--periodic-membership-reconcile-cycles",
+        type=int,
+        default=int(
+            os.environ.get(
+                "PERIODIC_MEMBERSHIP_RECONCILE_CYCLES",
+                DEFAULT_PERIODIC_MEMBERSHIP_RECONCILE_CYCLES,
+            )
+        ),
+        help=(
+            "Force a welcome-group membership reconciliation every N receive cycles "
+            "(or set PERIODIC_MEMBERSHIP_RECONCILE_CYCLES, set to 0 to disable)"
         ),
     )
     return parser.parse_args()

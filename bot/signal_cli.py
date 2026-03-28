@@ -198,7 +198,10 @@ class SignalClient(abc.ABC):
         return next((g for g in all_groups if g.name == group_name), None)
 
     @abc.abstractmethod
-    async def list_contacts(self, recipients: list[str]) -> list[ContactRecipient]:
+    async def list_contacts(
+        self,
+        recipients: list[str] | None = None,
+    ) -> list[ContactRecipient]:
         raise NotImplementedError
 
     @abc.abstractmethod
@@ -267,8 +270,14 @@ class SignalRpcClient(SignalClient):
             return [group for group in groups if group.resolved_id == group_id]
         return groups
 
-    async def list_contacts(self, recipients: list[str]) -> list[ContactRecipient]:
-        data = await self._request("listContacts", {"recipient": recipients})
+    async def list_contacts(
+        self,
+        recipients: list[str] | None = None,
+    ) -> list[ContactRecipient]:
+        params: dict[str, object] | None = None
+        if recipients is not None:
+            params = {"recipient": recipients}
+        data = await self._request("listContacts", params)
         if not isinstance(data, list):
             return []
         return [
