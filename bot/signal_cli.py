@@ -1,10 +1,9 @@
-import abc
 import asyncio
 import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Protocol
 
 from loguru import logger
 from pydantic import BaseModel, Field
@@ -15,6 +14,10 @@ class GroupMember(BaseModel):
     number: str | None = None
     name: str | None = None
     username: str | None = None
+
+    @property
+    def membership_identity(self) -> str | None:
+        return self.uuid or self.number or self.username
 
 
 class ContactRecipient(BaseModel):
@@ -47,7 +50,13 @@ class SignalGroup(BaseModel):
         return self.group_id_v2 or self.group_id or self.id
 
     def get_member_ids(self) -> set[str]:
-        return normalize_member_set(self.members)
+        result = set()
+        for member in self.members:
+            member_id = member.membership_identity
+            if member_id is None:
+                continue
+            result.add(member_id)
+        return result
 
 
 class GroupList(BaseModel):
@@ -174,75 +183,28 @@ class SignalCliError(RuntimeError):
         self.result = result
 
 
-class SignalClient(abc.ABC):
-    def __init__(
-        self,
-        account: str,
-        command_timeout_seconds: float = 30.0,
-        receive_timeout_seconds: int = 5,
-    ) -> None:
-        self.account = account
-        self.command_timeout_seconds = command_timeout_seconds
-        self.receive_timeout_seconds = receive_timeout_seconds
+class SignalClient(Protocol):
+    async def list_groups(self, group_id: str | None = None) -> list[SignalGroup]: ...
 
-    @abc.abstractmethod
-    async def list_groups(self, group_id: str | None = None) -> list[SignalGroup]:
-        raise NotImplementedError
+    async def get_group_by_id(self, group_id: str) -> SignalGroup | None: ...
 
-    async def get_group_by_id(self, group_id: str) -> SignalGroup | None:
-        all_groups = await self.list_groups()
-        return next((g for g in all_groups if g.resolved_id == group_id), None)
+    async def get_group_by_name(self, group_name: str) -> SignalGroup | None: ...
 
-    async def get_group_by_name(self, group_name: str) -> SignalGroup | None:
-        all_groups = await self.list_groups()
-        return next((g for g in all_groups if g.name == group_name), None)
-
-    @abc.abstractmethod
     async def list_contacts(
         self,
         recipients: list[str] | None = None,
-    ) -> list[ContactRecipient]:
-        raise NotImplementedError
+    ) -> list[ContactRecipient]: ...
 
-    @abc.abstractmethod
-    async def send_group_message(self, group_id: str, message: str) -> None:
-        raise NotImplementedError
+    async def send_group_message(self, group_id: str, message: str) -> None: ...
 
-    @abc.abstractmethod
-    async def send_sync_request(self) -> None:
-        raise NotImplementedError
+    async def send_sync_request(self) -> None: ...
 
-    @abc.abstractmethod
-    async def receive_events(self) -> list[SignalPayload]:
-        raise NotImplementedError
+    async def receive_events(self) -> list[SignalPayload]: ...
 
-    async def close(self) -> None:
-        """
-        Close any resources held by the Signal client.
-
-        Returns: None
-        """
-        return None
-
-    async def group_members(self, group_id: str) -> list[GroupMember]:
-        groups = await self.list_groups()
-        for group in groups:
-            if group.resolved_id == group_id:
-                return group.members
-        return []
-
-    async def group_member_keys(self, group_id: str) -> list[str]:
-        members = await self.group_members(group_id)
-        keys: list[str] = []
-        for member in members:
-            if member.uuid:
-                keys.append(member.uuid)
-            elif member.number:
-                keys.append(member.number)
-        return keys
+    async def close(self) -> None: ...
 
 
-class SignalRpcClient(SignalClient):
+class SignalRpcClient:
     def __init__(
         self,
         account: str,
@@ -250,7 +212,9 @@ class SignalRpcClient(SignalClient):
         command_timeout_seconds: float = 30.0,
         receive_timeout_seconds: int = 5,
     ) -> None:
-        super().__init__(account, command_timeout_seconds, receive_timeout_seconds)
+        self.account = account
+        self.command_timeout_seconds = command_timeout_seconds
+        self.receive_timeout_seconds = receive_timeout_seconds
         self.socket_path = socket_path
         self.connect_retry_seconds = 30.0
         self.connect_retry_interval_seconds = 0.5
@@ -269,6 +233,14 @@ class SignalRpcClient(SignalClient):
         if group_id:
             return [group for group in groups if group.resolved_id == group_id]
         return groups
+
+    async def get_group_by_id(self, group_id: str) -> SignalGroup | None:
+        all_groups = await self.list_groups()
+        return next((group for group in all_groups if group.resolved_id == group_id), None)
+
+    async def get_group_by_name(self, group_name: str) -> SignalGroup | None:
+        all_groups = await self.list_groups()
+        return next((group for group in all_groups if group.name == group_name), None)
 
     async def list_contacts(
         self,
@@ -547,24 +519,6 @@ def _parse_groups_from_object(data: object) -> list[SignalGroup]:
     if isinstance(data, dict):
         return GroupList.model_validate(data).groups
     return []
-
-
-def normalize_member_set(members: Iterable[GroupMember]) -> set[str]:
-    result = set()
-    for member in members:
-        member_id = member.uuid or member.number or member.username
-        if member_id is None:
-            continue
-        result.add(member_id)
-    return result
-
-
-def extract_group_id(payload: SignalPayload) -> str | None:
-    return payload.extract_group_id()
-
-
-def should_check_group(payload: SignalPayload) -> bool:
-    return payload.is_group_update()
 
 
 def _coerce_signal_error(message: str, exc: Exception) -> SignalCliError:
