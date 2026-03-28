@@ -21,6 +21,12 @@ from bot.signal_cli import (
 
 
 @dataclass
+class RecentSenderName:
+    name: str
+    observed_at: float
+
+
+@dataclass
 class BotConfig:
     account: str
     state_path: Path
@@ -33,14 +39,17 @@ class BotConfig:
     signal_receive_timeout_seconds: int
     signal_daemon_socket_path: Path
     group_cache_ttl_seconds: float
+    recent_sender_name_ttl_seconds: float
     unresolved_name_retry_delay_seconds: float
 
 
 @dataclass
 class BotRuntime:
     group_cache_ttl_seconds: float
+    recent_sender_name_ttl_seconds: float
     cached_welcome_group: SignalGroup | None = None
     cached_welcome_group_fetched_at: float | None = None
+    recent_sender_names_by_id: dict[str, RecentSenderName] | None = None
 
 
 class BotState(BaseModel):
@@ -48,6 +57,7 @@ class BotState(BaseModel):
     welcome_group_members: list[str] = Field(default_factory=list)
     pending_welcome_members: list[str] = Field(default_factory=list)
     last_welcome_sent_at: float | None = None
+    pending_name_retry_at: float | None = None
     """
     list of member ids (uuid or number)
     """
@@ -75,6 +85,8 @@ async def _run(config: BotConfig) -> None:
     )
     runtime = BotRuntime(
         group_cache_ttl_seconds=config.group_cache_ttl_seconds,
+        recent_sender_name_ttl_seconds=config.recent_sender_name_ttl_seconds,
+        recent_sender_names_by_id={},
     )
     try:
         if config.sync_on_startup:
@@ -99,6 +111,7 @@ async def _run(config: BotConfig) -> None:
                 logger.exception("Failed while receiving Signal events")
                 raise
             for payload in payloads:
+                _remember_recent_sender_name(runtime, payload)
                 logger.debug(payload)
                 if (
                     payload.is_group_update()
@@ -154,6 +167,7 @@ async def _seed_state(client: SignalClient, welcome_group: str) -> BotState:
         welcome_group_members=sorted(group.get_member_ids()),
         pending_welcome_members=[],
         last_welcome_sent_at=None,
+        pending_name_retry_at=None,
     )
 
 
@@ -235,7 +249,7 @@ async def _greet_new_welcome_group_members(
     if removed_members:
         pending_members -= removed_members
         removed_member_names = [
-            _render_member_name_by_id(member_id, contacts_by_id)
+            _render_member_name_by_id(member_id, contacts_by_id, runtime)
             for member_id in sorted(removed_members)
         ]
         resolved_removed_member_names = [
@@ -254,6 +268,8 @@ async def _greet_new_welcome_group_members(
         pending_members |= new_members
     state.welcome_group_members = sorted(members)
     state.pending_welcome_members = sorted(pending_members)
+    if not pending_members:
+        state.pending_name_retry_at = None
     _save_state(state, state_path)
 
     if not new_members:
@@ -270,6 +286,17 @@ async def _greet_new_welcome_group_members(
     if duration_till_welcome_msg is not None:
         logger.info(
             f"{len(pending_members)} pending members queued for another {duration_till_welcome_msg:.0f} seconds"
+        )
+        return
+
+    if (
+        state.pending_name_retry_at is not None
+        and now < state.pending_name_retry_at
+    ):
+        logger.debug(
+            "Pending member-name retry for group {} in another {:.0f} seconds",
+            state.welcome_group_id,
+            state.pending_name_retry_at - now,
         )
         return
 
@@ -298,6 +325,7 @@ def _save_state(state: BotState, state_path: Path) -> None:
             {str(member) for member in state.pending_welcome_members}
         ),
         last_welcome_sent_at=state.last_welcome_sent_at,
+        pending_name_retry_at=state.pending_name_retry_at,
     )
     state_path.write_text(encoded.model_dump_json(indent=2))
 
@@ -352,6 +380,17 @@ async def _flush_pending_welcome_messages(
     if duration_till_welcome_msg is not None:
         logger.debug(
             f"{len(pending_members)} pending members queued for another {duration_till_welcome_msg:.0f} seconds"
+        )
+        return
+
+    if (
+        state.pending_name_retry_at is not None
+        and now < state.pending_name_retry_at
+    ):
+        logger.debug(
+            "Pending member-name retry for group {} in another {:.0f} seconds",
+            state.welcome_group_id,
+            state.pending_name_retry_at - now,
         )
         return
 
@@ -425,27 +464,29 @@ async def _send_welcome_messages(
     recipient_ids = _member_recipient_ids(group_members, new_members)
     contacts_by_id = await _get_contacts_by_id(client, recipient_ids)
     pending_member_names = [
-        _render_member_name(member, contacts_by_id)
+        _render_member_name(member, contacts_by_id, runtime)
         for member in group_members
         if (member.uuid or member.number) in new_members
     ]
-    if unresolved_name_retry_delay_seconds > 0 and any(
+    unresolved_names_present = any(
         candidate is None for candidate in pending_member_names
+    )
+    if (
+        unresolved_names_present
+        and unresolved_name_retry_delay_seconds > 0
+        and state.pending_name_retry_at is None
     ):
-        _log_unresolved_members(group_members, new_members, contacts_by_id)
+        _log_unresolved_members(group_members, new_members, contacts_by_id, runtime)
         logger.info(
-            "Retrying unresolved member names for group {} after delay",
+            "Deferring unresolved member-name retry for group {} by {:.0f} seconds",
             state.welcome_group_id,
+            unresolved_name_retry_delay_seconds,
         )
-        await asyncio.sleep(unresolved_name_retry_delay_seconds)
-        contacts_by_id = await _get_contacts_by_id(client, recipient_ids)
-        pending_member_names = [
-            _render_member_name(member, contacts_by_id)
-            for member in group_members
-            if (member.uuid or member.number) in new_members
-        ]
-        if any(candidate is None for candidate in pending_member_names):
-            _log_unresolved_members(group_members, new_members, contacts_by_id)
+        state.pending_name_retry_at = now + unresolved_name_retry_delay_seconds
+        _save_state(state, state_path)
+        return
+    if unresolved_names_present:
+        _log_unresolved_members(group_members, new_members, contacts_by_id, runtime)
 
     # Prepare welcome message
     if any(name is None for name in pending_member_names):
@@ -470,6 +511,7 @@ async def _send_welcome_messages(
     await client.send_group_message(state.welcome_group_id, message)
     state.pending_welcome_members = []
     state.last_welcome_sent_at = now
+    state.pending_name_retry_at = None
     _save_state(state, state_path)
     logger.info(
         "Sent welcome message to group {} for {} member(s)",
@@ -482,20 +524,23 @@ def _log_unresolved_members(
     group_members: list[GroupMember],
     new_members: set[str],
     contacts_by_id: dict[str, ContactRecipient],
+    runtime: BotRuntime,
 ) -> None:
     for member in group_members:
         member_id = member.uuid or member.number
         if member_id is None or member_id not in new_members:
             continue
-        rendered_name = _render_member_name(member, contacts_by_id)
+        rendered_name = _render_member_name(member, contacts_by_id, runtime)
         if rendered_name is not None:
             continue
         contact = contacts_by_id.get(member_id)
+        recent_sender_name = _recent_sender_name_for_member(runtime, member)
         logger.debug(
             "Could not resolve member name for id={} member.name={!r} member.username={!r} "
             "contact_present={} contact.name={!r} contact.username={!r} "
             "contact.profile.given={!r} contact.profile.family={!r} "
-            "contact.given={!r} contact.family={!r} contact.nick={!r}",
+            "contact.given={!r} contact.family={!r} contact.nick={!r} "
+            "recent_sender_name={!r}",
             member_id,
             member.name,
             member.username,
@@ -507,6 +552,7 @@ def _log_unresolved_members(
             contact.given_name if contact else None,
             contact.family_name if contact else None,
             contact.nick_name if contact else None,
+            recent_sender_name,
         )
 
 
@@ -614,6 +660,7 @@ def _duration_till_welcome_msg(
 def _render_member_name(
     member: GroupMember,
     contacts_by_id: dict[str, ContactRecipient],
+    runtime: BotRuntime,
 ) -> str | None:
     member_id = member.uuid or member.number
     contact = contacts_by_id.get(member_id) if member_id else None
@@ -631,6 +678,9 @@ def _render_member_name(
         return username
     if contact and contact.name and not _looks_like_phone_number(contact.name):
         return contact.name
+    recent_sender_name = _recent_sender_name_for_member(runtime, member)
+    if recent_sender_name is not None:
+        return recent_sender_name
     return None
 
 
@@ -653,6 +703,7 @@ def _resolve_member_recipient(member: GroupMember) -> str | None:
 def _render_member_name_by_id(
     member_id: str,
     contacts_by_id: dict[str, ContactRecipient],
+    runtime: BotRuntime,
 ) -> str | None:
     contact = contacts_by_id.get(member_id)
     contact_name = _preferred_contact_name(contact)
@@ -661,7 +712,62 @@ def _render_member_name_by_id(
     username = _normalize_username(contact.username if contact else None)
     if username is not None:
         return username
+    recent_sender_name = _recent_sender_name_by_id(runtime, member_id)
+    if recent_sender_name is not None:
+        return recent_sender_name
     return None
+
+
+def _remember_recent_sender_name(runtime: BotRuntime, payload: SignalPayload) -> None:
+    sender_name = payload.sender_name()
+    if sender_name is None:
+        return
+    now = time.time()
+    _prune_recent_sender_names(runtime, now)
+    recent_sender_names = runtime.recent_sender_names_by_id
+    if recent_sender_names is None:
+        recent_sender_names = {}
+        runtime.recent_sender_names_by_id = recent_sender_names
+    for sender_id in payload.sender_ids():
+        recent_sender_names[sender_id] = RecentSenderName(sender_name, now)
+
+
+def _prune_recent_sender_names(runtime: BotRuntime, now: float) -> None:
+    recent_sender_names = runtime.recent_sender_names_by_id
+    if recent_sender_names is None:
+        return
+    expired_sender_ids = [
+        sender_id
+        for sender_id, recent_sender_name in recent_sender_names.items()
+        if now - recent_sender_name.observed_at > runtime.recent_sender_name_ttl_seconds
+    ]
+    for sender_id in expired_sender_ids:
+        del recent_sender_names[sender_id]
+
+
+def _recent_sender_name_for_member(
+    runtime: BotRuntime,
+    member: GroupMember,
+) -> str | None:
+    for member_id in [member.uuid, member.number, _resolve_member_recipient(member)]:
+        if member_id is None:
+            continue
+        recent_sender_name = _recent_sender_name_by_id(runtime, member_id)
+        if recent_sender_name is not None:
+            return recent_sender_name
+    return None
+
+
+def _recent_sender_name_by_id(runtime: BotRuntime, member_id: str) -> str | None:
+    now = time.time()
+    _prune_recent_sender_names(runtime, now)
+    recent_sender_names = runtime.recent_sender_names_by_id
+    if recent_sender_names is None:
+        return None
+    recent_sender_name = recent_sender_names.get(member_id)
+    if recent_sender_name is None:
+        return None
+    return recent_sender_name.name
 
 
 def _preferred_contact_name(contact: ContactRecipient | None) -> str | None:

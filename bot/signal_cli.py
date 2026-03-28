@@ -84,6 +84,10 @@ class SyncMessage(BaseModel):
 
 
 class Envelope(BaseModel):
+    source: str | None = None
+    source_name: str | None = Field(default=None, alias="sourceName")
+    source_uuid: str | None = Field(default=None, alias="sourceUuid")
+    source_number: str | None = Field(default=None, alias="sourceNumber")
     data_message: DataMessage | None = Field(default=None, alias="dataMessage")
     sync_message: SyncMessage | None = Field(default=None, alias="syncMessage")
 
@@ -133,6 +137,28 @@ class SignalPayload(BaseModel):
         if envelope.sync_message and envelope.sync_message.sent_message:
             return "sync-sent-message"
         return "unhandled-envelope"
+
+    def sender_ids(self) -> list[str]:
+        envelope = self.envelope
+        if not envelope:
+            return []
+        sender_ids = [
+            sender_id
+            for sender_id in [
+                envelope.source_uuid,
+                envelope.source,
+                envelope.source_number,
+            ]
+            if sender_id
+        ]
+        return list(dict.fromkeys(sender_ids))
+
+    def sender_name(self) -> str | None:
+        envelope = self.envelope
+        if not envelope or not envelope.source_name:
+            return None
+        normalized = envelope.source_name.strip()
+        return normalized or None
 
 
 @dataclass
