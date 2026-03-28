@@ -239,6 +239,11 @@ class Bot:
             logger.error("Could not resolve group info for welcome group!")
             return
 
+        logger.debug(
+            "Welcome group {} returned {} member(s) from signal-cli",
+            group_id,
+            len(group.members),
+        )
         members = group.get_member_ids()
         known_members = {str(member_id) for member_id in state.welcome_group_members}
         if not known_members:
