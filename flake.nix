@@ -14,6 +14,79 @@
     flake-utils.lib.eachDefaultSystem (system: let
       pkgs = import nixpkgs {inherit system;};
 
+      signalCli = pkgs.callPackage (
+        {
+          stdenvNoCC,
+          lib,
+          fetchurl,
+          makeWrapper,
+          openjdk25_headless,
+          libmatthew_java,
+          dbus,
+          dbus_java,
+          versionCheckHook,
+        }:
+          stdenvNoCC.mkDerivation (finalAttrs: {
+            pname = "signal-cli";
+            version = "0.14.1";
+
+            # Building from source would be preferred, but is much more involved.
+            src = fetchurl {
+              url = "https://github.com/AsamK/signal-cli/releases/download/v${finalAttrs.version}/signal-cli-${finalAttrs.version}.tar.gz";
+              hash = "sha256-zs2ksSxCwYhEZ/Oh8BN3U2ISwqXPshCl82HoL4wWNug=";
+            };
+
+            buildInputs = lib.optionals stdenvNoCC.hostPlatform.isLinux [
+              libmatthew_java
+              dbus
+              dbus_java
+            ];
+            nativeBuildInputs = [ makeWrapper ];
+
+            installPhase = ''
+              runHook preInstall
+              mkdir -p $out
+              cp -r lib $out/
+              install -Dm755 bin/signal-cli -t $out/bin
+            ''
+            + (
+              if stdenvNoCC.hostPlatform.isLinux then
+                ''
+                  makeWrapper ${openjdk25_headless}/bin/java $out/bin/signal-cli \
+                    --set JAVA_HOME "${openjdk25_headless}" \
+                    --add-flags "-classpath '$out/lib/*:${libmatthew_java}/lib/jni'" \
+                    --add-flags "-Djava.library.path=${libmatthew_java}/lib/jni:${dbus_java}/share/java/dbus:$out/lib" \
+                    --add-flags "org.asamk.signal.Main"
+                ''
+              else
+                ''
+                  wrapProgram $out/bin/signal-cli \
+                    --prefix PATH : ${lib.makeBinPath [ openjdk25_headless ]} \
+                    --set JAVA_HOME ${openjdk25_headless}
+                ''
+            )
+            + ''
+              runHook postInstall
+            '';
+
+            doInstallCheck = stdenvNoCC.hostPlatform.isLinux;
+
+            nativeInstallCheckInputs = [ versionCheckHook ];
+            versionCheckProgramArg = "--version";
+
+            meta = {
+              homepage = "https://github.com/AsamK/signal-cli";
+              description = "Command-line and dbus interface for communicating with the Signal messaging service";
+              mainProgram = "signal-cli";
+              changelog = "https://github.com/AsamK/signal-cli/blob/v${finalAttrs.version}/CHANGELOG.md";
+              sourceProvenance = with lib.sourceTypes; [ binaryBytecode ];
+              license = lib.licenses.gpl3;
+              maintainers = with lib.maintainers; [ ivan ];
+              platforms = lib.platforms.all;
+            };
+          })
+      ) {};
+
       repoDir = "/srv/veganactivistsnl-bot";
       venvDir = "${repoDir}/.venv";
       tmpDir = "${repoDir}/tmp";
@@ -25,7 +98,7 @@
         pkgs.coreutils
         pkgs.git
         pkgs.python3
-        pkgs.signal-cli
+        signalCli
       ];
 
       runBot = pkgs.writeShellApplication {
@@ -250,7 +323,8 @@
       };
     in {
       packages = {
-        signal-cli = pkgs.signal-cli;
+        default = signalCli;
+        signal-cli = signalCli;
       };
       devShells.default = pkgs.mkShell {
         packages = [
@@ -258,7 +332,7 @@
           pkgs.coreutils
           pkgs.git
           pkgs.python3
-          pkgs.signal-cli
+          signalCli
         ];
         shellHook = ''
           set -euo pipefail
