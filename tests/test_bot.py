@@ -5,7 +5,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from bot.bot import Bot, BotConfig, BotState
 from bot.signal_cli import ContactRecipient, GroupMember, SignalGroup, SignalPayload
@@ -101,7 +101,7 @@ class RunLoopTests(unittest.IsolatedAsyncioTestCase):
             client = MockSignalClient([[], [], [], []])
             config = _build_config(
                 state_path=state_path,
-                periodic_membership_reconcile_cycles=2,
+                periodic_membership_reconcile_interval_seconds=30.0,
             )
             state = BotState(
                 welcome_group_id="welcome-group",
@@ -111,7 +111,13 @@ class RunLoopTests(unittest.IsolatedAsyncioTestCase):
             flush_mock = AsyncMock()
             bot = TestBot(config, client, state, greet_mock, flush_mock)
 
-            with self.assertRaisesRegex(RuntimeError, "stop test loop"):
+            with (
+                patch(
+                    "bot.bot.time.monotonic",
+                    side_effect=[0.0, 5.0, 20.0, 31.0, 62.0],
+                ),
+                self.assertRaisesRegex(RuntimeError, "stop test loop"),
+            ):
                 await bot.run()
 
             self.assertEqual(greet_mock.await_count, 2)
@@ -124,7 +130,7 @@ class RunLoopTests(unittest.IsolatedAsyncioTestCase):
             client = MockSignalClient([[_group_update_payload("welcome-group")]])
             config = _build_config(
                 state_path=state_path,
-                periodic_membership_reconcile_cycles=1,
+                periodic_membership_reconcile_interval_seconds=30.0,
             )
             state = BotState(
                 welcome_group_id="welcome-group",
@@ -134,7 +140,10 @@ class RunLoopTests(unittest.IsolatedAsyncioTestCase):
             flush_mock = AsyncMock()
             bot = TestBot(config, client, state, greet_mock, flush_mock)
 
-            with self.assertRaisesRegex(RuntimeError, "stop test loop"):
+            with (
+                patch("bot.bot.time.monotonic", side_effect=[0.0, 31.0]),
+                self.assertRaisesRegex(RuntimeError, "stop test loop"),
+            ):
                 await bot.run()
 
             self.assertEqual(greet_mock.await_count, 1)
@@ -154,7 +163,7 @@ class WelcomeNameResolutionTests(unittest.IsolatedAsyncioTestCase):
                     None: [_contact("member-1", "Alice")],
                 },
             )
-            bot = Bot(_build_config(state_path=state_path, periodic_membership_reconcile_cycles=6), client=client)
+            bot = Bot(_build_config(state_path=state_path, periodic_membership_reconcile_interval_seconds=30.0), client=client)
             bot.state = BotState(
                 welcome_group_id="welcome-group",
                 welcome_group_members=["member-1"],
@@ -178,7 +187,7 @@ class WelcomeNameResolutionTests(unittest.IsolatedAsyncioTestCase):
                     ("member-1",): [_contact("member-1", "Alice")],
                 },
             )
-            bot = Bot(_build_config(state_path=state_path, periodic_membership_reconcile_cycles=6), client=client)
+            bot = Bot(_build_config(state_path=state_path, periodic_membership_reconcile_interval_seconds=30.0), client=client)
             bot.state = BotState(
                 welcome_group_id="welcome-group",
                 welcome_group_members=["member-1"],
@@ -202,7 +211,7 @@ class WelcomeNameResolutionTests(unittest.IsolatedAsyncioTestCase):
                     ("member-1",): [],
                 },
             )
-            bot = Bot(_build_config(state_path=state_path, periodic_membership_reconcile_cycles=6), client=client)
+            bot = Bot(_build_config(state_path=state_path, periodic_membership_reconcile_interval_seconds=30.0), client=client)
             bot.state = BotState(
                 welcome_group_id="welcome-group",
                 welcome_group_members=["member-1"],
@@ -249,7 +258,7 @@ class WelcomeNameResolutionTests(unittest.IsolatedAsyncioTestCase):
             bot = Bot(
                 _build_config(
                     state_path=state_path,
-                    periodic_membership_reconcile_cycles=6,
+                    periodic_membership_reconcile_interval_seconds=30.0,
                 ),
                 client=client,
             )
@@ -305,7 +314,7 @@ class WelcomeNameResolutionTests(unittest.IsolatedAsyncioTestCase):
             bot = Bot(
                 _build_config(
                     state_path=state_path,
-                    periodic_membership_reconcile_cycles=6,
+                    periodic_membership_reconcile_interval_seconds=30.0,
                     welcome_message_min_interval_seconds=interval_seconds,
                 ),
                 client=client,
@@ -351,7 +360,7 @@ class StatefulBehaviorTests(unittest.IsolatedAsyncioTestCase):
             bot = Bot(
                 _build_config(
                     state_path=state_path,
-                    periodic_membership_reconcile_cycles=6,
+                    periodic_membership_reconcile_interval_seconds=30.0,
                 ),
                 client=client,
             )
@@ -387,7 +396,7 @@ class StatefulBehaviorTests(unittest.IsolatedAsyncioTestCase):
             bot = Bot(
                 _build_config(
                     state_path=state_path,
-                    periodic_membership_reconcile_cycles=6,
+                    periodic_membership_reconcile_interval_seconds=30.0,
                 ),
                 client=client,
             )
@@ -415,7 +424,7 @@ class StatefulBehaviorTests(unittest.IsolatedAsyncioTestCase):
             bot = Bot(
                 _build_config(
                     state_path=state_path,
-                    periodic_membership_reconcile_cycles=6,
+                    periodic_membership_reconcile_interval_seconds=30.0,
                     state_max_age_seconds=60,
                 ),
                 client=client,
@@ -433,7 +442,7 @@ class StatefulBehaviorTests(unittest.IsolatedAsyncioTestCase):
         bot = Bot(
             _build_config(
                 state_path=Path("/tmp/unused-state.json"),
-                periodic_membership_reconcile_cycles=6,
+                periodic_membership_reconcile_interval_seconds=30.0,
             ),
             client=client,
         )
@@ -451,7 +460,7 @@ class StartupBehaviorTests(unittest.IsolatedAsyncioTestCase):
             bot = Bot(
                 _build_config(
                     state_path=state_path,
-                    periodic_membership_reconcile_cycles=6,
+                    periodic_membership_reconcile_interval_seconds=30.0,
                     sync_on_startup=True,
                 ),
                 client=client,
@@ -465,7 +474,7 @@ class StartupBehaviorTests(unittest.IsolatedAsyncioTestCase):
 
 def _build_config(
     state_path: Path,
-    periodic_membership_reconcile_cycles: int,
+    periodic_membership_reconcile_interval_seconds: float,
     welcome_message_min_interval_seconds: int = 90,
     state_max_age_seconds: int = 900,
     sync_on_startup: bool = False,
@@ -482,7 +491,7 @@ def _build_config(
         signal_receive_timeout_seconds=5,
         signal_daemon_socket_path=Path("/tmp/signal-cli.sock"),
         unresolved_name_retry_delay_seconds=10.0,
-        periodic_membership_reconcile_cycles=periodic_membership_reconcile_cycles,
+        periodic_membership_reconcile_interval_seconds=periodic_membership_reconcile_interval_seconds,
     )
 
 

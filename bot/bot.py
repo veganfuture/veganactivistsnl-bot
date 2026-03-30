@@ -32,7 +32,7 @@ class BotConfig:
     signal_receive_timeout_seconds: int
     signal_daemon_socket_path: Path
     unresolved_name_retry_delay_seconds: float
-    periodic_membership_reconcile_cycles: int
+    periodic_membership_reconcile_interval_seconds: float
 
 
 class BotState(BaseModel):
@@ -96,15 +96,18 @@ class Bot:
                 await self.discard_startup_backlog()
 
             i = 0
+            last_membership_reconcile_at = time.monotonic()
             while True:
                 try:
                     payloads = await self.client.receive_events()
                 except Exception:
                     logger.exception("Failed while receiving Signal events")
                     raise
+                cycle_finished_at = time.monotonic()
                 should_reconcile_membership = (
-                    self.config.periodic_membership_reconcile_cycles > 0
-                    and i % self.config.periodic_membership_reconcile_cycles == 0
+                    self.config.periodic_membership_reconcile_interval_seconds > 0
+                    and cycle_finished_at - last_membership_reconcile_at
+                    >= self.config.periodic_membership_reconcile_interval_seconds
                 )
                 state = self.require_state()
                 for payload in payloads:
@@ -116,11 +119,13 @@ class Bot:
                         should_reconcile_membership = False
                         try:
                             await self.greet_new_welcome_group_members()
+                            last_membership_reconcile_at = cycle_finished_at
                         except RuntimeError as exc:
                             logger.error("Error handling group update: {}", exc)
                 if should_reconcile_membership:
                     try:
                         await self.greet_new_welcome_group_members()
+                        last_membership_reconcile_at = cycle_finished_at
                     except RuntimeError as exc:
                         logger.error(
                             "Error reconciling welcome group membership: {}",

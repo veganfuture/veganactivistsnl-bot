@@ -25,7 +25,7 @@ DEFAULT_SIGNAL_CLI_TIMEOUT_SECONDS = 30.0
 DEFAULT_SIGNAL_RECEIVE_TIMEOUT_SECONDS = 5
 DEFAULT_SIGNAL_DAEMON_SOCKET_PATH = "/srv/veganactivistsnl-bot/run/signal-cli.sock"
 DEFAULT_UNRESOLVED_NAME_RETRY_DELAY_SECONDS = 10.0
-DEFAULT_PERIODIC_MEMBERSHIP_RECONCILE_CYCLES = 6
+DEFAULT_PERIODIC_MEMBERSHIP_RECONCILE_INTERVAL_SECONDS = 30.0
 
 
 def main() -> None:
@@ -52,9 +52,9 @@ def main() -> None:
         raise ValueError(
             "--unresolved-name-retry-delay-seconds must be zero or greater"
         )
-    if args.periodic_membership_reconcile_cycles < 0:
+    if args.periodic_membership_reconcile_interval_seconds < 0:
         raise ValueError(
-            "--periodic-membership-reconcile-cycles must be zero or greater"
+            "--periodic-membership-reconcile-interval-seconds must be zero or greater"
         )
     config = BotConfig(
         account=args.account,
@@ -68,7 +68,7 @@ def main() -> None:
         signal_receive_timeout_seconds=args.signal_receive_timeout_seconds,
         signal_daemon_socket_path=args.signal_daemon_socket_path,
         unresolved_name_retry_delay_seconds=args.unresolved_name_retry_delay_seconds,
-        periodic_membership_reconcile_cycles=args.periodic_membership_reconcile_cycles,
+        periodic_membership_reconcile_interval_seconds=args.periodic_membership_reconcile_interval_seconds,
     )
     run_bot(config)
 
@@ -193,17 +193,18 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--periodic-membership-reconcile-cycles",
-        type=int,
-        default=int(
+        "--periodic-membership-reconcile-interval-seconds",
+        type=float,
+        default=float(
             os.environ.get(
-                "PERIODIC_MEMBERSHIP_RECONCILE_CYCLES",
-                DEFAULT_PERIODIC_MEMBERSHIP_RECONCILE_CYCLES,
+                "PERIODIC_MEMBERSHIP_RECONCILE_INTERVAL_SECONDS",
+                DEFAULT_PERIODIC_MEMBERSHIP_RECONCILE_INTERVAL_SECONDS,
             )
         ),
         help=(
-            "Force a welcome-group membership reconciliation every N receive cycles "
-            "(or set PERIODIC_MEMBERSHIP_RECONCILE_CYCLES, set to 0 to disable)"
+            "Force a welcome-group membership reconciliation every N seconds, "
+            "checked at the end of each receive cycle "
+            "(or set PERIODIC_MEMBERSHIP_RECONCILE_INTERVAL_SECONDS, set to 0 to disable)"
         ),
     )
     return parser.parse_args()
