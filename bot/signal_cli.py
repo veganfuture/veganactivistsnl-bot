@@ -228,14 +228,17 @@ class SignalRpcClient:
         self._read_failure: SignalCliError | None = None
 
     async def list_groups(self, group_id: str | None = None) -> list[SignalGroup]:
-        data = await self._request("listGroups")
+        params: dict[str, object] | None = None
+        if group_id is not None:
+            params = {"groupId": group_id}
+        data = await self._request("listGroups", params)
         groups = _parse_groups_from_object(data)
         if group_id:
             return [group for group in groups if group.resolved_id == group_id]
         return groups
 
     async def get_group_by_id(self, group_id: str) -> SignalGroup | None:
-        all_groups = await self.list_groups()
+        all_groups = await self.list_groups(group_id)
         return next((group for group in all_groups if group.resolved_id == group_id), None)
 
     async def get_group_by_name(self, group_name: str) -> SignalGroup | None:

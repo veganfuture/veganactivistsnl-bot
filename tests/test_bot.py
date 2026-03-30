@@ -8,7 +8,13 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from bot.bot import Bot, BotConfig, BotState
-from bot.signal_cli import ContactRecipient, GroupMember, SignalGroup, SignalPayload
+from bot.signal_cli import (
+    ContactRecipient,
+    GroupMember,
+    SignalGroup,
+    SignalPayload,
+    SignalRpcClient,
+)
 
 
 class MockSignalClient:
@@ -470,6 +476,33 @@ class StartupBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 await bot.run()
 
             self.assertEqual(client.send_sync_request_calls, 1)
+
+
+class SignalRpcClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_get_group_by_id_requests_targeted_list_groups(self) -> None:
+        client = SignalRpcClient(
+            account="+31000000000",
+            socket_path=Path("/tmp/signal-cli.sock"),
+        )
+        client._request = AsyncMock(  # type: ignore[method-assign]
+            return_value=[
+                {
+                    "groupId": "welcome-group",
+                    "name": "Intro - Vegan Activists NL",
+                    "members": [],
+                }
+            ]
+        )
+
+        group = await client.get_group_by_id("welcome-group")
+
+        if group is None:
+            self.fail("Expected welcome group to be resolved")
+        self.assertEqual(group.resolved_id, "welcome-group")
+        client._request.assert_awaited_once_with(  # type: ignore[attr-defined]
+            "listGroups",
+            {"groupId": "welcome-group"},
+        )
 
 
 def _build_config(
