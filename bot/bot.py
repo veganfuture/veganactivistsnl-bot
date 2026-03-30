@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 import re
 from typing import Iterable
@@ -92,7 +92,10 @@ class Bot:
         Returns: None
         """
         logger.info(STARTUP_MSG)
-        logger.info("Bot config: {}", json.dumps(self.config, indent=2))
+        logger.info(
+            "Bot config: {}",
+            json.dumps(asdict(self.config), indent=2, default=str),
+        )
 
         try:
             if self.config.sync_on_startup:
