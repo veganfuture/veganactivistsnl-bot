@@ -262,7 +262,7 @@ class Bot:
         state = self.require_state()
 
         group_id = state.welcome_group_id
-        group = await self.get_welcome_group(force_refresh=True)
+        group = await self.get_welcome_group()
         if group is None:
             logger.error("Could not resolve group info for welcome group!")
             return
@@ -407,7 +407,7 @@ class Bot:
         state = self.require_state()
         resolved_group = group
         if resolved_group is None:
-            resolved_group = await self.get_welcome_group(force_refresh=False)
+            resolved_group = await self.get_welcome_group()
         group = resolved_group
         if group is None:
             logger.error("Could not resolve group info for pending welcomes!")
@@ -506,12 +506,9 @@ class Bot:
             len(new_members),
         )
 
-    async def get_welcome_group(self, force_refresh: bool) -> SignalGroup | None:
+    async def get_welcome_group(self) -> SignalGroup | None:
         """
         Fetch the configured welcome group.
-
-        Args:
-        - force_refresh - unused compatibility flag for callers that always need a fresh lookup
 
         Returns: welcome group details, if found
         """
