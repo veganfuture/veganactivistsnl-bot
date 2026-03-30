@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 from typing import Iterable
+import json
 
 from loguru import logger
 from pydantic import BaseModel, Field
@@ -46,6 +47,19 @@ class BotState(BaseModel):
     """
 
 
+SHUTDOWN_MSG = """
+-----------------
+Shutting Down Bot
+-----------------
+"""
+
+STARTUP_MSG = """
+---------------
+Starting Up Bot
+---------------
+"""
+
+
 def run_bot(config: BotConfig) -> None:
     try:
         asyncio.run(Bot(config).run())
@@ -77,8 +91,8 @@ class Bot:
 
         Returns: None
         """
-        logger.info("Starting signal bot for account {}", self.config.account)
-        logger.info("Bot config: {}", self.config)
+        logger.info(STARTUP_MSG)
+        logger.info("Bot config: {}", json.dumps(self.config, indent=2))
 
         try:
             if self.config.sync_on_startup:
@@ -140,7 +154,7 @@ class Bot:
                 i += 1
         finally:
             await self.client.close()
-            logger.info("Shutting down bot")
+            logger.info(SHUTDOWN_MSG)
 
     def require_state(self) -> BotState:
         """
