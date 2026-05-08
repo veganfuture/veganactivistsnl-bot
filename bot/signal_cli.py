@@ -79,6 +79,8 @@ class DataMessage(BaseModel):
     group_v2: GroupV2 | None = Field(default=None, alias="groupV2")
     group_change: dict | None = Field(default=None, alias="groupChange")
     group_id: str | None = Field(default=None, alias="groupId")
+    message: str | None = None
+    body: str | None = None
 
 
 class SyncSentMessage(BaseModel):
@@ -86,6 +88,8 @@ class SyncSentMessage(BaseModel):
     group_v2: GroupV2 | None = Field(default=None, alias="groupV2")
     group_change: dict | None = Field(default=None, alias="groupChange")
     group_id: str | None = Field(default=None, alias="groupId")
+    message: str | None = None
+    body: str | None = None
 
 
 class SyncMessage(BaseModel):
@@ -126,6 +130,16 @@ class SignalPayload(BaseModel):
         if message.group_change or message.group_v2:
             return True
         return False
+
+    def extract_message_text(self) -> str | None:
+        message = self._group_message()
+        if message is None:
+            return None
+        candidate = message.message or message.body
+        if candidate is None:
+            return None
+        normalized = candidate.strip()
+        return normalized or None
 
     def _group_message(self) -> DataMessage | SyncSentMessage | None:
         envelope = self.envelope
@@ -194,6 +208,8 @@ class SignalClient(Protocol):
         self,
         recipients: list[str] | None = None,
     ) -> list[ContactRecipient]: ...
+
+    async def send_contact_message(self, recipient: str, message: str) -> None: ...
 
     async def send_group_message(self, group_id: str, message: str) -> None: ...
 
@@ -265,6 +281,15 @@ class SignalRpcClient:
             {
                 "message": message,
                 "groupId": group_id,
+            },
+        )
+
+    async def send_contact_message(self, recipient: str, message: str) -> None:
+        await self._request(
+            "send",
+            {
+                "message": message,
+                "recipient": [recipient],
             },
         )
 

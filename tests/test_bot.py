@@ -5,16 +5,22 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
-from bot.bot import Bot, BotConfig, BotState
-from bot.signal_cli import (
-    ContactRecipient,
-    GroupMember,
-    SignalGroup,
-    SignalPayload,
-    SignalRpcClient,
+from bot.bot import SignalBotRunner
+from bot.config import (
+    BotConfig,
+    EventCalendarFeatureConfig,
+    GeminiConfig,
+    WelcomeFeatureConfig,
+    load_config,
 )
+from bot.event_calendar_feature import (
+    CalendarEvent,
+    EventCalendarFeature,
+)
+from bot.signal_cli import ContactRecipient, SignalGroup, SignalPayload, SignalRpcClient
+from bot.welcome_feature import WelcomeFeature, WelcomeState
 
 
 class MockSignalClient:
@@ -23,15 +29,15 @@ class MockSignalClient:
         payload_batches: list[list[SignalPayload]],
         groups: list[SignalGroup] | None = None,
         group_snapshots: list[list[SignalGroup]] | None = None,
-        contacts_by_request: dict[tuple[str, ...] | None, list[ContactRecipient]] | None = None,
+        contacts: list[ContactRecipient] | None = None,
     ) -> None:
         self._payload_batches = payload_batches
         self._groups = groups or []
         self._group_snapshots = group_snapshots
-        self._contacts_by_request = contacts_by_request or {}
+        self._contacts = contacts or []
         self.close_mock: AsyncMock = AsyncMock()
-        self.list_contacts_calls: list[tuple[str, ...] | None] = []
         self.sent_messages: list[tuple[str, str]] = []
+        self.sent_contact_messages: list[tuple[str, str]] = []
         self.receive_events_calls = 0
         self.send_sync_request_calls = 0
 
@@ -55,16 +61,24 @@ class MockSignalClient:
         self,
         recipients: list[str] | None = None,
     ) -> list[ContactRecipient]:
-        key = tuple(recipients) if recipients is not None else None
-        self.list_contacts_calls.append(key)
-        return self._contacts_by_request.get(key, [])
+        if recipients is None:
+            return self._contacts
+        return [
+            contact
+            for contact in self._contacts
+            if contact.number in recipients
+            or contact.uuid in recipients
+            or contact.username in recipients
+        ]
+
+    async def send_contact_message(self, recipient: str, message: str) -> None:
+        self.sent_contact_messages.append((recipient, message))
 
     async def send_group_message(self, group_id: str, message: str) -> None:
         self.sent_messages.append((group_id, message))
 
     async def send_sync_request(self) -> None:
         self.send_sync_request_calls += 1
-        return None
 
     async def receive_events(self) -> list[SignalPayload]:
         self.receive_events_calls += 1
@@ -76,227 +90,89 @@ class MockSignalClient:
         await self.close_mock()
 
 
-class TestBot(Bot):
-    def __init__(
+class DummyFeature:
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.setup_mock = AsyncMock()
+        self.handle_mock = AsyncMock()
+        self.cycle_mock = AsyncMock()
+
+    async def setup(self) -> None:
+        await self.setup_mock()
+
+    async def handle_payloads(
         self,
-        config: BotConfig,
-        client: MockSignalClient,
-        state: BotState,
-        greet_mock: AsyncMock,
-        flush_mock: AsyncMock,
+        payloads: list[SignalPayload],
+        cycle_finished_at: float,
     ) -> None:
-        super().__init__(config, client=client)
-        self._test_state = state
-        self.greet_mock = greet_mock
-        self.flush_mock = flush_mock
+        await self.handle_mock(payloads, cycle_finished_at)
 
-    def load_state(self) -> BotState | None:
-        return self._test_state
-
-    async def greet_new_welcome_group_members(self) -> None:
-        await self.greet_mock()
-
-    async def flush_pending_welcome_messages(self) -> None:
-        await self.flush_mock()
+    async def on_cycle(self, cycle_finished_at: float) -> None:
+        await self.cycle_mock(cycle_finished_at)
 
 
-class RunLoopTests(unittest.IsolatedAsyncioTestCase):
-    async def test_periodic_membership_reconcile_runs_without_events(self) -> None:
+class FakeCalendarParser:
+    def __init__(self, events: list[CalendarEvent]) -> None:
+        self.events = events
+        self.messages: list[str] = []
+
+    async def parse_events(self, message_text: str) -> list[CalendarEvent]:
+        self.messages.append(message_text)
+        return self.events
+
+
+class RunnerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_runner_calls_composed_feature_lifecycle(self) -> None:
+        client = MockSignalClient([[]])
+        feature = DummyFeature("dummy")
+        runner = SignalBotRunner(
+            _build_bot_config(sync_on_startup=False),
+            client,
+            [feature],
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "stop test loop"):
+            await runner.run()
+
+        feature.setup_mock.assert_awaited_once()
+        feature.handle_mock.assert_awaited_once()
+        feature.cycle_mock.assert_awaited_once()
+        client.close_mock.assert_awaited_once()
+
+    async def test_runner_requests_sync_when_enabled(self) -> None:
+        client = MockSignalClient([[]])
+        runner = SignalBotRunner(
+            _build_bot_config(sync_on_startup=True),
+            client,
+            [DummyFeature("dummy")],
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "stop test loop"):
+            await runner.run()
+
+        self.assertEqual(client.send_sync_request_calls, 1)
+
+
+class WelcomeFeatureTests(unittest.IsolatedAsyncioTestCase):
+    async def test_send_welcome_messages_uses_static_message(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            state_path = Path(temp_dir) / "state.json"
-            client = MockSignalClient([[], [], [], []])
-            config = _build_config(
-                state_path=state_path,
-                periodic_membership_reconcile_interval_seconds=30.0,
+            feature = WelcomeFeature(
+                _build_welcome_feature_config(Path(temp_dir) / "state.json"),
+                MockSignalClient([], groups=[_group("welcome-group", "Intro", ["member-1"])]),
             )
-            state = BotState(
-                welcome_group_id="welcome-group",
-                welcome_group_members=["known-member"],
-            )
-            greet_mock = AsyncMock()
-            flush_mock = AsyncMock()
-            bot = TestBot(config, client, state, greet_mock, flush_mock)
-
-            with (
-                patch(
-                    "bot.bot.time.monotonic",
-                    side_effect=[0.0, 5.0, 20.0, 31.0, 62.0],
-                ),
-                self.assertRaisesRegex(RuntimeError, "stop test loop"),
-            ):
-                await bot.run()
-
-            self.assertEqual(greet_mock.await_count, 2)
-            self.assertEqual(flush_mock.await_count, 4)
-            client.close_mock.assert_awaited_once()
-
-    async def test_group_update_does_not_duplicate_periodic_reconcile(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            state_path = Path(temp_dir) / "state.json"
-            client = MockSignalClient([[_group_update_payload("welcome-group")]])
-            config = _build_config(
-                state_path=state_path,
-                periodic_membership_reconcile_interval_seconds=30.0,
-            )
-            state = BotState(
-                welcome_group_id="welcome-group",
-                welcome_group_members=["known-member"],
-            )
-            greet_mock = AsyncMock()
-            flush_mock = AsyncMock()
-            bot = TestBot(config, client, state, greet_mock, flush_mock)
-
-            with (
-                patch("bot.bot.time.monotonic", side_effect=[0.0, 31.0]),
-                self.assertRaisesRegex(RuntimeError, "stop test loop"),
-            ):
-                await bot.run()
-
-            self.assertEqual(greet_mock.await_count, 1)
-            flush_mock.assert_awaited_once()
-            client.close_mock.assert_awaited_once()
-
-
-class WelcomeNameResolutionTests(unittest.IsolatedAsyncioTestCase):
-    async def test_send_welcome_messages_uses_full_contacts_first(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            state_path = Path(temp_dir) / "state.json"
-            group = _welcome_group(["member-1"])
-            client = MockSignalClient(
-                [],
-                groups=[group],
-                contacts_by_request={
-                    None: [_contact("member-1", "Alice")],
-                },
-            )
-            bot = Bot(_build_config(state_path=state_path, periodic_membership_reconcile_interval_seconds=30.0), client=client)
-            bot.state = BotState(
+            feature.welcome_state = WelcomeState(
                 welcome_group_id="welcome-group",
                 welcome_group_members=["member-1"],
                 pending_welcome_members=["member-1"],
             )
 
-            await bot.send_welcome_messages({"member-1"}, now=1.0, group=group)
-
-            self.assertEqual(client.list_contacts_calls, [None])
-            self.assertEqual(client.sent_messages, [("welcome-group", "Welcome Alice")])
-
-    async def test_send_welcome_messages_falls_back_to_recipient_contacts(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            state_path = Path(temp_dir) / "state.json"
-            group = _welcome_group(["member-1"])
-            client = MockSignalClient(
-                [],
-                groups=[group],
-                contacts_by_request={
-                    None: [],
-                    ("member-1",): [_contact("member-1", "Alice")],
-                },
-            )
-            bot = Bot(_build_config(state_path=state_path, periodic_membership_reconcile_interval_seconds=30.0), client=client)
-            bot.state = BotState(
-                welcome_group_id="welcome-group",
-                welcome_group_members=["member-1"],
-                pending_welcome_members=["member-1"],
-            )
-
-            await bot.send_welcome_messages({"member-1"}, now=1.0, group=group)
-
-            self.assertEqual(client.list_contacts_calls, [None, ("member-1",)])
-            self.assertEqual(client.sent_messages, [("welcome-group", "Welcome Alice")])
-
-    async def test_send_welcome_messages_retries_once_then_sends_without_name(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            state_path = Path(temp_dir) / "state.json"
-            group = _welcome_group(["member-1"])
-            client = MockSignalClient(
-                [],
-                groups=[group],
-                contacts_by_request={
-                    None: [],
-                    ("member-1",): [],
-                },
-            )
-            bot = Bot(_build_config(state_path=state_path, periodic_membership_reconcile_interval_seconds=30.0), client=client)
-            bot.state = BotState(
-                welcome_group_id="welcome-group",
-                welcome_group_members=["member-1"],
-                pending_welcome_members=["member-1"],
-                pending_name_retry_at=None,
-            )
-
-            await bot.send_welcome_messages(
+            await feature.send_welcome_messages(
                 {"member-1"},
                 now=1.0,
-                group=group,
-                unresolved_name_retry_delay_seconds=10.0,
+                group=_group("welcome-group", "Intro", ["member-1"]),
             )
 
-            self.assertEqual(client.sent_messages, [])
-            self.assertEqual(bot.require_state().pending_name_retry_at, 11.0)
-
-            await bot.send_welcome_messages(
-                {"member-1"},
-                now=12.0,
-                group=group,
-                unresolved_name_retry_delay_seconds=10.0,
-            )
-
-            self.assertEqual(
-                client.list_contacts_calls,
-                [None, ("member-1",), None, ("member-1",)],
-            )
-            self.assertEqual(client.sent_messages, [("welcome-group", "Welcome")])
-            self.assertIsNone(bot.require_state().pending_name_retry_at)
-
-    async def test_send_welcome_messages_retries_once_for_multiple_members(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            state_path = Path(temp_dir) / "state.json"
-            group = _welcome_group(["member-1", "member-2"])
-            client = MockSignalClient(
-                [],
-                groups=[group],
-                contacts_by_request={
-                    None: [],
-                    ("member-1", "member-2"): [],
-                },
-            )
-            bot = Bot(
-                _build_config(
-                    state_path=state_path,
-                    periodic_membership_reconcile_interval_seconds=30.0,
-                ),
-                client=client,
-            )
-            bot.state = BotState(
-                welcome_group_id="welcome-group",
-                welcome_group_members=["member-1", "member-2"],
-                pending_welcome_members=["member-1", "member-2"],
-            )
-
-            await bot.send_welcome_messages(
-                {"member-1", "member-2"},
-                now=1.0,
-                group=group,
-                unresolved_name_retry_delay_seconds=10.0,
-            )
-
-            self.assertEqual(client.sent_messages, [])
-            self.assertEqual(bot.require_state().pending_name_retry_at, 11.0)
-
-            await bot.send_welcome_messages(
-                {"member-1", "member-2"},
-                now=12.0,
-                group=group,
-                unresolved_name_retry_delay_seconds=10.0,
-            )
-
-            self.assertEqual(
-                client.list_contacts_calls,
-                [None, ("member-1", "member-2"), None, ("member-1", "member-2")],
-            )
-            self.assertEqual(client.sent_messages, [("welcome-group", "Welcome")])
-            self.assertIsNone(bot.require_state().pending_name_retry_at)
+            self.assertEqual(feature.client.sent_messages, [("welcome-group", "Welcome")])  # type: ignore[attr-defined]
 
     async def test_multiple_members_are_batched_after_welcome_interval(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -306,118 +182,79 @@ class WelcomeNameResolutionTests(unittest.IsolatedAsyncioTestCase):
             client = MockSignalClient(
                 [],
                 group_snapshots=[
-                    [_welcome_group(["existing-member", "member-1"])],
-                    [_welcome_group(["existing-member", "member-1", "member-2"])],
-                    [_welcome_group(["existing-member", "member-1", "member-2"])],
+                    [_group("welcome-group", "Intro", ["existing-member", "member-1"])],
+                    [_group("welcome-group", "Intro", ["existing-member", "member-1", "member-2"])],
+                    [_group("welcome-group", "Intro", ["existing-member", "member-1", "member-2"])],
                 ],
-                contacts_by_request={
-                    None: [
-                        _contact("member-1", "Alice"),
-                        _contact("member-2", "Bob"),
-                    ],
-                },
             )
-            bot = Bot(
-                _build_config(
-                    state_path=state_path,
-                    periodic_membership_reconcile_interval_seconds=30.0,
-                    welcome_message_min_interval_seconds=interval_seconds,
+            feature = WelcomeFeature(
+                _build_welcome_feature_config(
+                    state_path,
+                    message_min_interval_seconds=interval_seconds,
                 ),
-                client=client,
+                client,
             )
-            bot.state = BotState(
+            feature.welcome_state = WelcomeState(
                 welcome_group_id="welcome-group",
                 welcome_group_members=["existing-member"],
                 pending_welcome_members=[],
                 last_welcome_sent_at=now,
             )
 
-            await bot.greet_new_welcome_group_members()
-            await bot.greet_new_welcome_group_members()
+            await feature.greet_new_welcome_group_members()
+            await feature.greet_new_welcome_group_members()
 
             self.assertEqual(client.sent_messages, [])
             self.assertEqual(
-                bot.require_state().pending_welcome_members,
+                feature.require_welcome_state().pending_welcome_members,
                 ["member-1", "member-2"],
             )
 
-            bot.require_state().last_welcome_sent_at = now - interval_seconds - 1
-            await bot.flush_pending_welcome_messages()
-
-            self.assertEqual(
-                client.sent_messages,
-                [("welcome-group", "Welcome Alice and Bob")],
+            feature.require_welcome_state().last_welcome_sent_at = (
+                now - interval_seconds - 1
             )
-            self.assertEqual(bot.require_state().pending_welcome_members, [])
+            await feature.flush_pending_welcome_messages()
 
+            self.assertEqual(client.sent_messages, [("welcome-group", "Welcome")])
+            self.assertEqual(feature.require_welcome_state().pending_welcome_members, [])
 
-class StatefulBehaviorTests(unittest.IsolatedAsyncioTestCase):
     async def test_username_only_member_join_and_leave_updates_membership(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            state_path = Path(temp_dir) / "state.json"
-            now = time.time()
             client = MockSignalClient(
                 [],
                 group_snapshots=[
-                    [_welcome_group_custom([{"uuid": "existing-member"}, {"username": "u:alice"}])],
-                    [_welcome_group_custom([{"uuid": "existing-member"}])],
+                    [_group_custom("welcome-group", "Intro", [{"uuid": "existing-member"}, {"username": "u:alice"}])],
+                    [_group_custom("welcome-group", "Intro", [{"uuid": "existing-member"}])],
                 ],
             )
-            bot = Bot(
-                _build_config(
-                    state_path=state_path,
-                    periodic_membership_reconcile_interval_seconds=30.0,
-                ),
-                client=client,
+            feature = WelcomeFeature(
+                _build_welcome_feature_config(Path(temp_dir) / "state.json"),
+                client,
             )
-            bot.state = BotState(
+            feature.welcome_state = WelcomeState(
                 welcome_group_id="welcome-group",
                 welcome_group_members=["existing-member"],
                 pending_welcome_members=[],
-                last_welcome_sent_at=now,
+                last_welcome_sent_at=time.time(),
             )
 
-            await bot.greet_new_welcome_group_members()
-            self.assertEqual(bot.require_state().pending_welcome_members, ["u:alice"])
-
-            await bot.greet_new_welcome_group_members()
-            self.assertEqual(bot.require_state().pending_welcome_members, [])
-            self.assertEqual(bot.require_state().welcome_group_members, ["existing-member"])
-
-    async def test_mixed_uuid_number_username_group_is_seeded_correctly(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            state_path = Path(temp_dir) / "state.json"
-            client = MockSignalClient(
-                [],
-                groups=[
-                    _welcome_group_custom(
-                        [
-                            {"uuid": "uuid-member"},
-                            {"number": "+31600000000"},
-                            {"username": "u:alice"},
-                        ]
-                    )
-                ],
-            )
-            bot = Bot(
-                _build_config(
-                    state_path=state_path,
-                    periodic_membership_reconcile_interval_seconds=30.0,
-                ),
-                client=client,
-            )
-
-            seeded_state = await bot.seed_state()
-
+            await feature.greet_new_welcome_group_members()
             self.assertEqual(
-                seeded_state.welcome_group_members,
-                ["+31600000000", "u:alice", "uuid-member"],
+                feature.require_welcome_state().pending_welcome_members,
+                ["u:alice"],
             )
 
-    async def test_stale_state_reseeds_on_run(self) -> None:
+            await feature.greet_new_welcome_group_members()
+            self.assertEqual(feature.require_welcome_state().pending_welcome_members, [])
+            self.assertEqual(
+                feature.require_welcome_state().welcome_group_members,
+                ["existing-member"],
+            )
+
+    async def test_stale_state_reseeds_on_setup(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             state_path = Path(temp_dir) / "state.json"
-            stale_state = BotState(
+            stale_state = WelcomeState(
                 welcome_group_id="welcome-group",
                 welcome_group_members=["stale-member"],
             )
@@ -426,56 +263,146 @@ class StatefulBehaviorTests(unittest.IsolatedAsyncioTestCase):
             state_path.touch(exist_ok=True)
             os.utime(state_path, (stale_mtime, stale_mtime))
 
-            client = MockSignalClient([[]], groups=[_welcome_group(["fresh-member"])])
-            bot = Bot(
-                _build_config(
-                    state_path=state_path,
-                    periodic_membership_reconcile_interval_seconds=30.0,
-                    state_max_age_seconds=60,
+            client = MockSignalClient([[]], groups=[_group("welcome-group", "Intro", ["fresh-member"])])
+            feature = WelcomeFeature(
+                _build_welcome_feature_config(
+                    state_path,
+                    welcome_state_max_age_seconds=60,
                 ),
-                client=client,
+                client,
             )
 
-            with self.assertRaisesRegex(RuntimeError, "stop test loop"):
-                await bot.run()
+            await feature.setup()
 
-            self.assertEqual(bot.require_state().welcome_group_members, ["fresh-member"])
+            self.assertEqual(
+                feature.require_welcome_state().welcome_group_members,
+                ["fresh-member"],
+            )
 
     async def test_discard_startup_backlog_drains_until_empty(self) -> None:
         client = MockSignalClient(
             [[_group_update_payload("welcome-group")], [_group_update_payload("welcome-group")], []]
         )
-        bot = Bot(
-            _build_config(
-                state_path=Path("/tmp/unused-state.json"),
-                periodic_membership_reconcile_interval_seconds=30.0,
-            ),
-            client=client,
+        feature = WelcomeFeature(
+            _build_welcome_feature_config(Path("/tmp/unused-state.json")),
+            client,
         )
 
-        await bot.discard_startup_backlog()
+        await feature.discard_startup_backlog()
 
         self.assertEqual(client.receive_events_calls, 3)
 
 
-class StartupBehaviorTests(unittest.IsolatedAsyncioTestCase):
-    async def test_run_requests_sync_when_enabled(self) -> None:
+class EventCalendarFeatureTests(unittest.IsolatedAsyncioTestCase):
+    async def test_feature_parses_matching_group_message_and_sends_output_user_message(
+        self,
+    ) -> None:
+        client = MockSignalClient(
+            [],
+            groups=[_group("events-group", "Events", ["member-1"])],
+            contacts=[_contact("+31612345678", "Calendar User")],
+        )
+        parser = FakeCalendarParser(
+            [
+                CalendarEvent(
+                    date="2026-05-10",
+                    time="19:30",
+                    location="Amsterdam",
+                    description="Community meetup",
+                )
+            ]
+        )
+        feature = EventCalendarFeature(
+            _build_event_feature_config("+31612345678"),
+            client,
+            parser,
+        )
+
+        await feature.setup()
+        await feature.handle_payloads(
+            [_message_payload("events-group", "See you Sunday at 19:30 in Amsterdam")],
+            cycle_finished_at=1.0,
+        )
+
+        self.assertEqual(
+            parser.messages,
+            ["See you Sunday at 19:30 in Amsterdam"],
+        )
+        self.assertEqual(len(client.sent_contact_messages), 1)
+        self.assertEqual(client.sent_contact_messages[0][0], "+31612345678")
+        self.assertIn('"source_group": "Events"', client.sent_contact_messages[0][1])
+        self.assertIn('"date": "2026-05-10"', client.sent_contact_messages[0][1])
+        self.assertIn('"location": "Amsterdam"', client.sent_contact_messages[0][1])
+
+    async def test_feature_ignores_other_groups_and_group_updates(self) -> None:
+        client = MockSignalClient(
+            [],
+            groups=[_group("events-group", "Events", ["member-1"])],
+            contacts=[_contact("+31612345678", "Calendar User")],
+        )
+        parser = FakeCalendarParser([CalendarEvent(date="2026-05-10", time="19:30")])
+        feature = EventCalendarFeature(
+            _build_event_feature_config("+31612345678"),
+            client,
+            parser,
+        )
+
+        await feature.setup()
+        await feature.handle_payloads(
+            [
+                _message_payload("other-group", "Other message"),
+                _group_update_payload("events-group"),
+            ],
+            cycle_finished_at=1.0,
+        )
+
+        self.assertEqual(parser.messages, [])
+        self.assertEqual(client.sent_contact_messages, [])
+
+
+class SignalPayloadTests(unittest.TestCase):
+    def test_extract_message_text_prefers_message_body(self) -> None:
+        payload = _message_payload("events-group", "Meetup tomorrow")
+        self.assertEqual(payload.extract_message_text(), "Meetup tomorrow")
+
+
+class ConfigLoadingTests(unittest.TestCase):
+    def test_load_config_applies_defaults_and_resolves_relative_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            state_path = Path(temp_dir) / "state.json"
-            client = MockSignalClient([[]], groups=[_welcome_group(["member-1"])])
-            bot = Bot(
-                _build_config(
-                    state_path=state_path,
-                    periodic_membership_reconcile_interval_seconds=30.0,
-                    sync_on_startup=True,
-                ),
-                client=client,
+            config_dir = Path(temp_dir)
+            config_path = config_dir / "config.toml"
+            config_path.write_text(
+                '\n'.join(
+                    [
+                        'account = "+31000000000"',
+                        "verbose = true",
+                        'signal_daemon_socket_path = "run/signal-cli.sock"',
+                        "",
+                        "[welcome_feature]",
+                        'welcome_state_path = "data/welcome-state.json"',
+                    ]
+                )
             )
 
-            with self.assertRaisesRegex(RuntimeError, "stop test loop"):
-                await bot.run()
+            config = load_config(config_path)
 
-            self.assertEqual(client.send_sync_request_calls, 1)
+            self.assertEqual(config.account, "+31000000000")
+            self.assertTrue(config.verbose)
+            self.assertEqual(
+                config.signal_daemon_socket_path,
+                config_dir / "run/signal-cli.sock",
+            )
+            if config.welcome_feature is None:
+                self.fail("Expected welcome feature config to be loaded")
+            self.assertEqual(
+                config.welcome_feature.welcome_state_path,
+                config_dir / "data/welcome-state.json",
+            )
+            self.assertEqual(
+                config.welcome_feature.message_min_interval_seconds,
+                90,
+            )
+            self.assertIsNone(config.event_calendar_feature)
 
 
 class SignalRpcClientTests(unittest.IsolatedAsyncioTestCase):
@@ -488,7 +415,7 @@ class SignalRpcClientTests(unittest.IsolatedAsyncioTestCase):
             return_value=[
                 {
                     "groupId": "welcome-group",
-                    "name": "Intro - Vegan Activists NL",
+                    "name": "Intro",
                     "members": [],
                 }
             ]
@@ -505,26 +432,76 @@ class SignalRpcClientTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
-def _build_config(
-    state_path: Path,
-    periodic_membership_reconcile_interval_seconds: float,
-    welcome_message_min_interval_seconds: int = 90,
-    state_max_age_seconds: int = 900,
-    sync_on_startup: bool = False,
-) -> BotConfig:
+def _build_bot_config(sync_on_startup: bool) -> BotConfig:
     return BotConfig(
         account="+31000000000",
-        state_path=state_path,
-        welcome_group="Intro - Vegan Activists NL",
-        welcome_message="Welcome {{newusers}}",
-        welcome_message_min_interval_seconds=welcome_message_min_interval_seconds,
-        state_max_age_seconds=state_max_age_seconds,
         sync_on_startup=sync_on_startup,
         signal_cli_timeout_seconds=30.0,
         signal_receive_timeout_seconds=5,
         signal_daemon_socket_path=Path("/tmp/signal-cli.sock"),
-        unresolved_name_retry_delay_seconds=10.0,
-        periodic_membership_reconcile_interval_seconds=periodic_membership_reconcile_interval_seconds,
+    )
+
+
+def _build_welcome_feature_config(
+    welcome_state_path: Path,
+    message_min_interval_seconds: int = 90,
+    welcome_state_max_age_seconds: int = 900,
+) -> WelcomeFeatureConfig:
+    return WelcomeFeatureConfig(
+        welcome_state_path=welcome_state_path,
+        group_name="Intro",
+        message="Welcome",
+        message_min_interval_seconds=message_min_interval_seconds,
+        welcome_state_max_age_seconds=welcome_state_max_age_seconds,
+        periodic_membership_reconcile_interval_seconds=30.0,
+    )
+
+
+def _build_event_feature_config(output_user: str) -> EventCalendarFeatureConfig:
+    return EventCalendarFeatureConfig(
+        group_name="Events",
+        output_user=output_user,
+        gemini=GeminiConfig(
+            api_key="test-key",
+            model="gemini-2.5-flash",
+            timeout_seconds=30.0,
+            timezone_name="Europe/Amsterdam",
+        ),
+    )
+
+
+def _contact(number: str, name: str) -> ContactRecipient:
+    return ContactRecipient.model_validate(
+        {
+            "number": number,
+            "name": name,
+        }
+    )
+
+
+def _group(
+    group_id: str,
+    group_name: str,
+    member_ids: list[str],
+) -> SignalGroup:
+    return _group_custom(
+        group_id,
+        group_name,
+        [{"uuid": member_id} for member_id in member_ids],
+    )
+
+
+def _group_custom(
+    group_id: str,
+    group_name: str,
+    member_specs: list[dict[str, str]],
+) -> SignalGroup:
+    return SignalGroup.model_validate(
+        {
+            "groupId": group_id,
+            "name": group_name,
+            "members": member_specs,
+        }
     )
 
 
@@ -543,22 +520,18 @@ def _group_update_payload(group_id: str) -> SignalPayload:
     )
 
 
-def _welcome_group(member_ids: list[str]) -> SignalGroup:
-    return _welcome_group_custom([{"uuid": member_id} for member_id in member_ids])
-
-
-def _welcome_group_custom(member_specs: list[dict[str, str]]) -> SignalGroup:
-    return SignalGroup.model_validate(
+def _message_payload(group_id: str, message: str) -> SignalPayload:
+    return SignalPayload.model_validate(
         {
-            "groupId": "welcome-group",
-            "name": "Intro - Vegan Activists NL",
-            "members": member_specs,
+            "envelope": {
+                "sourceName": "Alice",
+                "dataMessage": {
+                    "groupId": group_id,
+                    "message": message,
+                },
+            }
         }
     )
-
-
-def _contact(member_id: str, given_name: str) -> ContactRecipient:
-    return ContactRecipient(uuid=member_id, name=given_name)
 
 
 if __name__ == "__main__":

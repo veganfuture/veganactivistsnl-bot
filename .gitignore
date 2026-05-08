@@ -10,7 +10,8 @@ tmp/
 run/
 
 # Bot state
-/data/*.json
+data/
+configs/
 
 # Nix
 result
