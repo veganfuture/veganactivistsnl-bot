@@ -223,12 +223,10 @@ class SignalClient(Protocol):
 class SignalRpcClient:
     def __init__(
         self,
-        account: str,
         socket_path: Path,
         command_timeout_seconds: float = 30.0,
         receive_timeout_seconds: int = 5,
     ) -> None:
-        self.account = account
         self.command_timeout_seconds = command_timeout_seconds
         self.receive_timeout_seconds = receive_timeout_seconds
         self.socket_path = socket_path
@@ -255,7 +253,9 @@ class SignalRpcClient:
 
     async def get_group_by_id(self, group_id: str) -> SignalGroup | None:
         all_groups = await self.list_groups(group_id)
-        return next((group for group in all_groups if group.resolved_id == group_id), None)
+        return next(
+            (group for group in all_groups if group.resolved_id == group_id), None
+        )
 
     async def get_group_by_name(self, group_name: str) -> SignalGroup | None:
         all_groups = await self.list_groups()
@@ -272,7 +272,9 @@ class SignalRpcClient:
         if not isinstance(data, list):
             return []
         return [
-            ContactRecipient.model_validate(item) for item in data if isinstance(item, dict)
+            ContactRecipient.model_validate(item)
+            for item in data
+            if isinstance(item, dict)
         ]
 
     async def send_group_message(self, group_id: str, message: str) -> None:
@@ -352,7 +354,9 @@ class SignalRpcClient:
         last_error: OSError | None = None
         while True:
             try:
-                reader, writer = await asyncio.open_unix_connection(str(self.socket_path))
+                reader, writer = await asyncio.open_unix_connection(
+                    str(self.socket_path)
+                )
             except OSError as exc:
                 last_error = exc
                 if time.monotonic() >= deadline:
@@ -381,7 +385,9 @@ class SignalRpcClient:
             CommandResult(stdout="", stderr=message, returncode=-1),
         )
 
-    async def _request(self, method: str, params: dict[str, object] | None = None) -> object:
+    async def _request(
+        self, method: str, params: dict[str, object] | None = None
+    ) -> object:
         await self._ensure_connected()
         self._raise_if_read_failed()
         assert self._writer is not None
@@ -517,7 +523,6 @@ class SignalRpcClient:
 
 
 def create_signal_client(
-    account: str,
     command_timeout_seconds: float,
     receive_timeout_seconds: int,
     daemon_socket_path: Path,
@@ -534,7 +539,6 @@ def create_signal_client(
     Returns: configured Signal client
     """
     return SignalRpcClient(
-        account,
         socket_path=daemon_socket_path,
         command_timeout_seconds=command_timeout_seconds,
         receive_timeout_seconds=receive_timeout_seconds,
@@ -543,7 +547,9 @@ def create_signal_client(
 
 def _parse_groups_from_object(data: object) -> list[SignalGroup]:
     if isinstance(data, list):
-        return [SignalGroup.model_validate(item) for item in data if isinstance(item, dict)]
+        return [
+            SignalGroup.model_validate(item) for item in data if isinstance(item, dict)
+        ]
     if isinstance(data, dict):
         return GroupList.model_validate(data).groups
     return []

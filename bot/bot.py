@@ -41,7 +41,6 @@ def run_bot(config: BotConfig) -> None:
 
 async def _run_bot_async(config: BotConfig) -> None:
     client = create_signal_client(
-        account=config.account,
         command_timeout_seconds=config.signal_cli_timeout_seconds,
         receive_timeout_seconds=config.signal_receive_timeout_seconds,
         daemon_socket_path=config.signal_daemon_socket_path,
@@ -122,5 +121,7 @@ def _build_features(config: BotConfig, client: SignalClient) -> list[BotFeature]
         features.append(WelcomeFeature(config.welcome_feature, client))
     if config.event_calendar_feature is not None:
         parser = GeminiCalendarEventParser(config.event_calendar_feature.gemini)
-        features.append(EventCalendarFeature(config.event_calendar_feature, client, parser))
+        features.append(
+            EventCalendarFeature(config.event_calendar_feature, client, parser)
+        )
     return features

@@ -15,7 +15,7 @@ class GeminiConfig(BaseModel):
 
 
 class EventCalendarFeatureConfig(BaseModel):
-    group_name: str = "Events"
+    group_name: str = "Events - Vegan Activists NL"
     output_user: str = Field(min_length=1)
     gemini: GeminiConfig
 
@@ -39,12 +39,13 @@ class WelcomeFeatureConfig(BaseModel):
 
 
 class BotConfig(BaseModel):
-    account: str = Field(min_length=1)
     verbose: bool = False
     sync_on_startup: bool = True
     signal_cli_timeout_seconds: float = Field(default=30.0, gt=0)
     signal_receive_timeout_seconds: int = Field(default=5, gt=0)
-    signal_daemon_socket_path: Path = Path("/srv/veganactivistsnl-bot/run/signal-cli.sock")
+    signal_daemon_socket_path: Path = Path(
+        "/srv/veganactivistsnl-bot/run/signal-cli.sock"
+    )
     welcome_feature: WelcomeFeatureConfig | None = None
     event_calendar_feature: EventCalendarFeatureConfig | None = None
 
@@ -70,7 +71,9 @@ def load_config(config_path: Path) -> BotConfig:
     except ValidationError as exc:
         raise ValueError(f"Invalid config file {config_path}: {exc}") from exc
     if config.welcome_feature is None and config.event_calendar_feature is None:
-        raise ValueError("Invalid config file: at least one bot feature must be configured")
+        raise ValueError(
+            "Invalid config file: at least one bot feature must be configured"
+        )
     return config
 
 

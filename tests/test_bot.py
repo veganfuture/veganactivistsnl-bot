@@ -162,7 +162,9 @@ class WelcomeFeatureTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             feature = WelcomeFeature(
                 _build_welcome_feature_config(Path(temp_dir) / "state.json"),
-                MockSignalClient([], groups=[_group("welcome-group", "Intro", ["member-1"])]),
+                MockSignalClient(
+                    [], groups=[_group("welcome-group", "Intro", ["member-1"])]
+                ),
             )
             feature.welcome_state = WelcomeState(
                 welcome_group_id="welcome-group",
@@ -176,7 +178,10 @@ class WelcomeFeatureTests(unittest.IsolatedAsyncioTestCase):
                 group=_group("welcome-group", "Intro", ["member-1"]),
             )
 
-            self.assertEqual(feature.client.sent_messages, [("welcome-group", "Welcome")])  # type: ignore[attr-defined]
+            assert isinstance(feature.client, MockSignalClient)
+            self.assertEqual(
+                feature.client.sent_messages, [("welcome-group", "Welcome")]
+            )  # type: ignore[attr-defined]
 
     async def test_multiple_members_are_batched_after_welcome_interval(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -187,8 +192,20 @@ class WelcomeFeatureTests(unittest.IsolatedAsyncioTestCase):
                 [],
                 group_snapshots=[
                     [_group("welcome-group", "Intro", ["existing-member", "member-1"])],
-                    [_group("welcome-group", "Intro", ["existing-member", "member-1", "member-2"])],
-                    [_group("welcome-group", "Intro", ["existing-member", "member-1", "member-2"])],
+                    [
+                        _group(
+                            "welcome-group",
+                            "Intro",
+                            ["existing-member", "member-1", "member-2"],
+                        )
+                    ],
+                    [
+                        _group(
+                            "welcome-group",
+                            "Intro",
+                            ["existing-member", "member-1", "member-2"],
+                        )
+                    ],
                 ],
             )
             feature = WelcomeFeature(
@@ -220,15 +237,27 @@ class WelcomeFeatureTests(unittest.IsolatedAsyncioTestCase):
             await feature.flush_pending_welcome_messages()
 
             self.assertEqual(client.sent_messages, [("welcome-group", "Welcome")])
-            self.assertEqual(feature.require_welcome_state().pending_welcome_members, [])
+            self.assertEqual(
+                feature.require_welcome_state().pending_welcome_members, []
+            )
 
     async def test_username_only_member_join_and_leave_updates_membership(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             client = MockSignalClient(
                 [],
                 group_snapshots=[
-                    [_group_custom("welcome-group", "Intro", [{"uuid": "existing-member"}, {"username": "u:alice"}])],
-                    [_group_custom("welcome-group", "Intro", [{"uuid": "existing-member"}])],
+                    [
+                        _group_custom(
+                            "welcome-group",
+                            "Intro",
+                            [{"uuid": "existing-member"}, {"username": "u:alice"}],
+                        )
+                    ],
+                    [
+                        _group_custom(
+                            "welcome-group", "Intro", [{"uuid": "existing-member"}]
+                        )
+                    ],
                 ],
             )
             feature = WelcomeFeature(
@@ -249,7 +278,9 @@ class WelcomeFeatureTests(unittest.IsolatedAsyncioTestCase):
             )
 
             await feature.greet_new_welcome_group_members()
-            self.assertEqual(feature.require_welcome_state().pending_welcome_members, [])
+            self.assertEqual(
+                feature.require_welcome_state().pending_welcome_members, []
+            )
             self.assertEqual(
                 feature.require_welcome_state().welcome_group_members,
                 ["existing-member"],
@@ -267,7 +298,9 @@ class WelcomeFeatureTests(unittest.IsolatedAsyncioTestCase):
             state_path.touch(exist_ok=True)
             os.utime(state_path, (stale_mtime, stale_mtime))
 
-            client = MockSignalClient([[]], groups=[_group("welcome-group", "Intro", ["fresh-member"])])
+            client = MockSignalClient(
+                [[]], groups=[_group("welcome-group", "Intro", ["fresh-member"])]
+            )
             feature = WelcomeFeature(
                 _build_welcome_feature_config(
                     state_path,
@@ -285,7 +318,11 @@ class WelcomeFeatureTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_discard_startup_backlog_drains_until_empty(self) -> None:
         client = MockSignalClient(
-            [[_group_update_payload("welcome-group")], [_group_update_payload("welcome-group")], []]
+            [
+                [_group_update_payload("welcome-group")],
+                [_group_update_payload("welcome-group")],
+                [],
+            ]
         )
         feature = WelcomeFeature(
             _build_welcome_feature_config(Path("/tmp/unused-state.json")),
@@ -393,9 +430,8 @@ class ConfigLoadingTests(unittest.TestCase):
             config_dir = Path(temp_dir)
             config_path = config_dir / "config.toml"
             config_path.write_text(
-                '\n'.join(
+                "\n".join(
                     [
-                        'account = "+31000000000"',
                         "verbose = true",
                         'signal_daemon_socket_path = "run/signal-cli.sock"',
                         "",
@@ -407,7 +443,6 @@ class ConfigLoadingTests(unittest.TestCase):
 
             config = load_config(config_path)
 
-            self.assertEqual(config.account, "+31000000000")
             self.assertTrue(config.verbose)
             self.assertEqual(
                 config.signal_daemon_socket_path,
@@ -429,7 +464,6 @@ class ConfigLoadingTests(unittest.TestCase):
 class SignalRpcClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_get_group_by_id_requests_targeted_list_groups(self) -> None:
         client = SignalRpcClient(
-            account="+31000000000",
             socket_path=Path("/tmp/signal-cli.sock"),
         )
         client._request = AsyncMock(  # type: ignore[method-assign]
@@ -455,7 +489,6 @@ class SignalRpcClientTests(unittest.IsolatedAsyncioTestCase):
 
 def _build_bot_config(sync_on_startup: bool) -> BotConfig:
     return BotConfig(
-        account="+31000000000",
         sync_on_startup=sync_on_startup,
         signal_cli_timeout_seconds=30.0,
         signal_receive_timeout_seconds=5,
