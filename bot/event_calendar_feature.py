@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Protocol
 from zoneinfo import ZoneInfo
 
+import httpx
 from google import genai
 from google.genai import types
 from loguru import logger
@@ -176,6 +177,11 @@ class EventCalendarFeature:
                 location=event.location,
                 description=event.description,
             )
+            logger.debug(
+                "Sending calendar event to output user {}: {}",
+                self.output_recipient,
+                record.model_dump(),
+            )
             await self.client.send_contact_message(
                 self.output_recipient,
                 record.model_dump_json(indent=2),
@@ -214,10 +220,29 @@ class GeminiCalendarEventParser:
 
         Returns: parsed calendar items
         """
-        parsed = await asyncio.wait_for(
-            asyncio.to_thread(self._request_parse, message_text),
-            timeout=self.config.timeout_seconds + 1,
-        )
+        try:
+            parsed = await asyncio.wait_for(
+                asyncio.to_thread(self._request_parse, message_text),
+                timeout=self.config.timeout_seconds + 1,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "Gemini event parsing exceeded {:.1f}s timeout; skipping message",
+                self.config.timeout_seconds + 1,
+            )
+            return []
+        except httpx.TimeoutException as exc:
+            logger.error(
+                "Gemini event parsing timed out during HTTP request: {}",
+                exc,
+            )
+            return []
+        except httpx.TransportError as exc:
+            logger.error(
+                "Gemini event parsing failed due to HTTP transport error: {}",
+                exc,
+            )
+            return []
         return [
             event
             for event in parsed.events
@@ -230,15 +255,21 @@ class GeminiCalendarEventParser:
         client = genai.Client(
             api_key=self.config.api_key,
             http_options=types.HttpOptions(
-                timeout=max(1, int(self.config.timeout_seconds))
+                timeout=max(1, int(self.config.timeout_seconds * 1000))
             ),
+        )
+        logger.debug(
+            "Sending Gemini request with model {} and timeout {:.1f}s: {}",
+            self.config.model,
+            self.config.timeout_seconds,
+            message_text,
         )
         response = client.models.generate_content(
             model=self.config.model,
-            contents=f"Signal message:\n{message_text}",
+            contents=message_text,
             config=types.GenerateContentConfig(
                 system_instruction=(
-                    "Extract meetup or event information from the provided Signal "
+                    "Extract meetup or event information from the provided "
                     "message. If the message is not an event, return an empty list. "
                     f"Interpret relative dates using timezone {self.config.timezone_name} "
                     f"and current date {today}."
@@ -247,6 +278,11 @@ class GeminiCalendarEventParser:
                 response_schema=CalendarParseResponse,
                 temperature=0.1,
             ),
+        )
+        logger.debug(
+            "Received Gemini response. text={} parsed={}",
+            response.text,
+            response.parsed,
         )
         if isinstance(response.parsed, CalendarParseResponse):
             return response.parsed

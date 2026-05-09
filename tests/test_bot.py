@@ -5,7 +5,10 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from typing import NoReturn
 from unittest.mock import AsyncMock
+
+import httpx
 
 from bot.bot import SignalBotRunner
 from bot.config import (
@@ -18,6 +21,7 @@ from bot.config import (
 from bot.event_calendar_feature import (
     CalendarEvent,
     EventCalendarFeature,
+    GeminiCalendarEventParser,
 )
 from bot.signal_cli import ContactRecipient, SignalGroup, SignalPayload, SignalRpcClient
 from bot.welcome_feature import WelcomeFeature, WelcomeState
@@ -360,6 +364,23 @@ class EventCalendarFeatureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.sent_contact_messages, [])
 
 
+class GeminiCalendarEventParserTests(unittest.IsolatedAsyncioTestCase):
+    async def test_parse_events_returns_empty_list_on_connect_timeout(self) -> None:
+        parser = GeminiCalendarEventParser(
+            GeminiConfig(
+                api_key="test-key",
+                model="gemini-2.5-flash",
+                timeout_seconds=30.0,
+                timezone_name="Europe/Amsterdam",
+            )
+        )
+        parser._request_parse = _raise_connect_timeout  # type: ignore[method-assign]
+
+        events = await parser.parse_events("See you Sunday at 19:30 in Amsterdam")
+
+        self.assertEqual(events, [])
+
+
 class SignalPayloadTests(unittest.TestCase):
     def test_extract_message_text_prefers_message_body(self) -> None:
         payload = _message_payload("events-group", "Meetup tomorrow")
@@ -468,6 +489,11 @@ def _build_event_feature_config(output_user: str) -> EventCalendarFeatureConfig:
             timezone_name="Europe/Amsterdam",
         ),
     )
+
+
+def _raise_connect_timeout(message_text: str) -> NoReturn:
+    del message_text
+    raise httpx.ConnectTimeout("TLS handshake timed out")
 
 
 def _contact(number: str, name: str) -> ContactRecipient:
