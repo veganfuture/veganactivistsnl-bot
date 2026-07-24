@@ -35,24 +35,16 @@ This ensures the server always runs with the correct versions.
 
 Python dependencies are installed via:
 
+```sh
+uv sync --frozen
 ```
-requirements.txt
-```
-
-They are installed into:
-
-```
-/srv/veganactivistsnl-bot/.venv
-```
-
-This keeps Python dependencies separate from system packages.
 
 ### 3. signal-cli daemon
 
 `signal-cli` runs as a persistent daemon and exposes a local JSON-RPC Unix socket at:
 
 ```
-/srv/veganactivistsnl-bot/run/signal-cli.sock
+$repo_dir/run/signal-cli.sock
 ```
 
 The Python bot connects to that socket instead of spawning a fresh `signal-cli` process for every command.
@@ -63,7 +55,7 @@ Three systemd units manage the bot:
 
 | Unit               | Purpose                             |
 | ------------------ | ----------------------------------- |
-| `signal-cli-daemon.service` | Runs persistent `signal-cli` daemon |
+| `signal-daemon.service` | Runs persistent `signal-cli` daemon |
 | `bot.service`    | Runs the bot                        |
 | `bot-poll.timer` | Checks for git updates every minute |
 
@@ -125,32 +117,27 @@ After this try to run the bot manually first, see "Run the bot locally".
 
 ## 4. Install services
 
-Before installing the services, create an env file that systemd will load for the bot:
+Run the flake installer with the Signal account and repository path:
 
 ```
-cd /srv/veganactivistsnl-bot
-cat > .env <<'EOF'
-SIGNAL_ACCOUNT=+123456789
-EOF
+nix run .#install -- --runtime --signal-account '+316...' --repo-dir . --verbose-level 1
 ```
 
-`bot.service` and `signal-cli-daemon.service` read `/srv/veganactivistsnl-bot/.env`, so make sure `SIGNAL_ACCOUNT` is set correctly before you start the services.
-
-Then run the flake installer:
-
-```
-nix run .#install
-```
-
-The installer writes the systemd units to run as the current shell user.
+The installer writes the systemd units to run as the current shell user. Pass `--runtime` to install runtime units in `/run/systemd/system`.
 
 This installs and enables:
 
-* `signal-cli-daemon.service`
+* `signal-daemon.service`
 * `bot.service`
 * `bot-poll.timer`
 
 The bot should start automatically.
+
+To remove the services later:
+
+```bash
+nix run .#uninstall
+```
 
 ---
 
@@ -174,85 +161,38 @@ No manual deployment is required.
 
 # Development
 
+## Install precommit hooks
+
+Once you're in a nix development shell run:
+
+```
+install-precommit-hooks
+```
+
+You should now have precommit hooks that run type checks, linters, formatters and unit tests.
+
 ### Run the bot locally
 
-```
-nix run .#run
-```
+Before the bot's signal daemon will work you need to link the new device (the machine you're on) to the Signal bot, see "Link the bot to Signal".
 
-This uses the persistent `signal-cli` daemon, so for local testing the most reliable flow is:
+Run the signal daemon:
 
-1. Create a local `.env` file:
-
-```bash
-cd /path/to/veganactivistsnl-bot
-cat > .env <<'EOF'
-SIGNAL_ACCOUNT=+31612345678
-EOF
+```sh
+nix run .#signal-daemon -- --signal-acount +316... 
 ```
 
-2. Start the signal-cli daemon in one terminal:
+You can also make a $SIGNAL_ACCOUNT environment variable (put that in your .envrc), so that you never need to supply the phone number.
 
-```bash
-nix run .#install
-systemctl status signal-cli-daemon.service
-journalctl -u signal-cli-daemon.service -f
+Then run the bot from a nix dev shell:
+
+```sh
+bot --config configs/test.toml
 ```
-
-3. Start the bot in another terminal:
-
-```bash
-nix develop
-python -m bot --verbose
-```
-
-If you want to run everything locally without installing any systemd services, use two terminals:
-
-Terminal 1, start the daemon:
-
-```bash
-nix develop
-set -a
-source .env
-set +a
-mkdir -p tmp run
-TMPDIR="$PWD/tmp" signal-cli -u "$SIGNAL_ACCOUNT" daemon --socket "$PWD/run/signal-cli.sock" --receive-mode on-connection
-```
-
-If you get Java temp-dir errors, force the JVM temp dir explicitly:
-
-```bash
-TMPDIR="$PWD/tmp" JAVA_TOOL_OPTIONS="-Djava.io.tmpdir=$PWD/tmp" signal-cli -u "$SIGNAL_ACCOUNT" daemon --socket "$PWD/run/signal-cli.sock" --receive-mode on-connection
-```
-
-Terminal 2, start the bot:
-
-```bash
-nix develop
-set -a
-source .env
-set +a
-python -m bot --verbose --signal-daemon-socket-path "$PWD/run/signal-cli.sock"
-```
-
-Or first run 
-
-```
-nix develop
-```
-
-and then
-
-```
-SIGNAL_ACCOUNT=+31612345678 python -m bot 
-```
-
-Of course the account phone number needs to match the bot's phone number.
 
 ### Test the update process manually
 
 ```
-nix run .#pollOnce
+nix run .#poll-once
 ```
 
 This performs one polling cycle.
@@ -270,7 +210,7 @@ journalctl -u bot.service -f
 View the signal-cli daemon logs:
 
 ```
-journalctl -u signal-cli-daemon.service -f
+journalctl -u signal-daemon.service -f
 ```
 
 View deployment checks:
@@ -301,42 +241,9 @@ This runs once per minute.
 
 # Configuration
 
-## Environment variables
-
-You can configure the bot using a `.env` file.
-
-Example:
-
-```
-/srv/veganactivistsnl-bot/.env
-```
-
-Example content:
-
-```
-SIGNAL_ACCOUNT=+123456789
-BOT_STATE_FILE=/srv/veganactivistsnl-bot/data/group_state.json
-CONTACTS_CACHE_TTL_SECONDS=300
-UNRESOLVED_NAME_RETRY_DELAY_SECONDS=10
-```
-
-To enable this, ensure the systemd unit contains:
-
-```
-EnvironmentFile=/srv/veganactivistsnl-bot/.env
-```
-
-After editing:
-
-```
-sudo systemctl daemon-reload
-sudo systemctl restart signal-cli-daemon.service
-sudo systemctl restart bot.service
-```
-
 ## CLI options
 
-You can also pass configuration via CLI flags (these override environment variables):
+Configuration is passed through CLI flags and installer arguments. For service installation, use `nix run .#install -- --runtime --signal-account ... --repo-dir ...` and add `--verbose-level 1` or `--verbose-level 2` if you want daemon verbosity.
 
 ```
 python -m bot --account +123456789 --state-path /srv/veganactivistsnl-bot/data/group_state.json
@@ -408,5 +315,5 @@ journalctl -u bot.service -n 100
 ## Force redeploy
 
 ```
-nix run .#pollOnce
+nix run .#poll-once
 ```

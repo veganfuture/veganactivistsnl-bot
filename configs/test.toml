@@ -1,0 +1,14 @@
+verbose = true
+sync_on_startup = false
+
+[welcome_feature]
+
+group_name = "Test - Vegan Activists NL"
+message = '''
+Welcome to the Vegan Activists NL community 💚
+
+Our main Signal groups:
+  • Chat – for general discussion: https://veganactivists.nl/chat\n"
+  • Events – for sharing and discovering events: https://veganactivists.nl/events\n"
+
+This intro group is just to welcome you and help you find your way. Someone of the welcome crew will reach out to you 💫c'''

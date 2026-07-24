@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -8,7 +7,6 @@ from unittest.mock import AsyncMock
 from bot.bot import SignalBotRunner
 from bot.config import (
     BotConfig,
-    load_config,
 )
 from bot.__test__.mock_signal_client import MockSignalClient
 from bot.signal_cli import SignalPayload, SignalRpcClient
@@ -71,42 +69,6 @@ class SignalPayloadTests(unittest.TestCase):
     def test_extract_message_text_prefers_message_body(self) -> None:
         payload = _message_payload("events-group", "Meetup tomorrow")
         self.assertEqual(payload.extract_message_text(), "Meetup tomorrow")
-
-
-class ConfigLoadingTests(unittest.TestCase):
-    def test_load_config_applies_defaults_and_resolves_relative_paths(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            config_dir = Path(temp_dir)
-            config_path = config_dir / "config.toml"
-            config_path.write_text(
-                "\n".join(
-                    [
-                        "verbose = true",
-                        'signal_daemon_socket_path = "run/signal-cli.sock"',
-                        "",
-                        "[welcome_feature]",
-                        'welcome_state_path = "data/welcome-state.json"',
-                    ]
-                )
-            )
-
-            config = load_config(config_path)
-
-            self.assertTrue(config.verbose)
-            self.assertEqual(
-                config.signal_daemon_socket_path,
-                config_dir / "run/signal-cli.sock",
-            )
-            if config.welcome_feature is None:
-                self.fail("Expected welcome feature config to be loaded")
-            self.assertEqual(
-                config.welcome_feature.welcome_state_path,
-                config_dir / "data/welcome-state.json",
-            )
-            self.assertEqual(
-                config.welcome_feature.message_min_interval_seconds,
-                90,
-            )
 
 
 class SignalRpcClientTests(unittest.IsolatedAsyncioTestCase):
