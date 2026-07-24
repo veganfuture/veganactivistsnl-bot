@@ -362,6 +362,15 @@
         #!/usr/bin/env bash
         ${self.checks.${system}.pre-commit-check.shellHook}
       '';
+
+      link = pkgs.writeScriptBin "link" ''
+        ${nuShellScript}
+        def main [--machine-name: string] {
+          required_flags [{ name: "machine-name", value: $machine_name }]
+          let link_name = $"Vegan Activists NL bot (($machine_name))"
+          ${pkgs.signal-cli}/bin/signal-cli link -n $link_name
+        }
+      '';
     in {
       packages = {
         default = pkgs.signal-cli;
@@ -395,6 +404,10 @@
       };
 
       apps = {
+        link = {
+          type = "app";
+          program = "${link}/bin/link";
+        };
         install = {
           type = "app";
           program = "${install}/bin/bot-install";

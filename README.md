@@ -252,40 +252,17 @@ python -m bot --account +123456789 --state-path /srv/veganactivistsnl-bot/data/g
 
 The bot should run as a **linked device** on an existing Signal account. Do this once on the server, as the same user that runs the service (default `ubuntu`).
 
-1. Generate a QR code on the server:
+1. Generate a QR code on the server for the machine your're own:
 
 ```
-signal-cli link -n "veganactivistsnl-bot"
+nix run .#link -- -machine-name <MY-MACHINE-NAME>
 ```
+
+If you don't see a QR code, because your terminal does not support graphic display, the take the `sgnl://` address and generate a QR Code to it. 
 
 2. On your phone: Signal → Settings → Linked devices → **Link new device**, then scan the QR code.
 
-3. Confirm the link worked:
-
-```
-signal-cli listDevices
-```
-
-Signal state is stored under `~/.local/share/signal-cli`, so the same user must run the bot and the linking step.
-
----
-
-# Updating Python dependencies
-
-Edit:
-
-```
-requirements.txt
-```
-
-Then push the change:
-
-```
-git commit -am "update dependencies"
-git push
-```
-
-The next poll cycle will restart the service and reinstall dependencies if necessary.
+3. The bot should now show up under linked devices in Signal. Signal state is stored under `~/.local/share/signal-cli`, so the same user must run the bot and the linking step.
 
 ---
 
