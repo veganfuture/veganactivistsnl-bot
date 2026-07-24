@@ -1,6 +1,6 @@
 # Signal Bot (Nix + systemd + Git polling)
 
-This project runs a **Signal bot** on a small Linux server (e.g. an AWS Lightsail instance) using a very simple deployment model:
+This project runs a **Signal bot** on a small Linux server using a very simple deployment model:
 
 * **Push to `main`**
 * The server **polls the repository**
@@ -8,11 +8,8 @@ This project runs a **Signal bot** on a small Linux server (e.g. an AWS Lightsai
 
   * it **pulls the repo**
   * **restarts the bot**
-  * Python dependencies are installed automatically
 
-The runtime environment is provided by **Nix**, while Python dependencies are installed using **uv** into a local virtual environment.
-
-This avoids containers, CI/CD pipelines, and complex deployment tools while still giving reproducible system dependencies.
+Dependencies are automatically installed by Nix and uv.
 
 ---
 
