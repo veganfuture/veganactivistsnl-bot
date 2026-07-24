@@ -68,31 +68,36 @@ When a new commit is detected:
 
 These steps are only needed once.
 
+
+## 0. Requirements
+
+Requires a Linux machine with bash and systemd installed. Any regular flavour distribution should work: Fedora, Ubuntu, Arch, Redhat. Ironically NixOS won't work, because you can not just intsall systemd services on NixOs (the flake would have to expose nixosModules that can be imported in a NixOs config, which it currently doesn't).
+
 ## 1. Install Nix and Git
 
 Install the multi-user version of Nix:
 
-```
+```sh
 sh <(curl -L https://nixos.org/nix/install) --daemon
 ```
 
 Enable flakes:
 
-```
+```sh
 sudo mkdir -p /etc/nix
 echo "experimental-features = nix-command flakes" | sudo tee /etc/nix/nix.conf
 ```
 
 Install Git:
 
-```
+```sh
 nix profile install nixpkgs#git
 ```
 
 ---
 ## 2. Create project directory
 
-```
+```sh
 mkdir /srv/
 sudo chown $(whoami) /srv
 cd /srv
@@ -103,26 +108,17 @@ git clone https://github.com/veganfuture/veganactivistsnl-bot.git
 
 ## 3. First time link Signal device
 
-```
-cd /srv/veganactivistsnl-bot
-nix develop
-```
-
 Before the bot will work you need to link the new device (the machine you're on) to the Signal bot, see "Link the bot to Signal".
-
-After this try to run the bot manually first, see "Run the bot locally".
 
 ## 4. Install services
 
-Run the flake installer with the Signal account and repository path:
+To setup systemd services that run the bot and keep the bot up to date, run:
 
+```sh
+nix run .#install -- --signal-account '+316...' --config configs/prod.toml
 ```
-nix run .#install -- --runtime --signal-account '+316...' --repo-dir . --verbose-level 1
-```
 
-The installer writes the systemd units to run as the current shell user. Pass `--runtime` to install runtime units in `/run/systemd/system`.
-
-This installs and enables:
+This installs and enables the following systemd services:
 
 * `signal-daemon.service`
 * `bot.service`
@@ -130,9 +126,17 @@ This installs and enables:
 
 The bot should start automatically.
 
+To see if the bot is running and connected to Signal check:
+
+```sh
+journalctl -u bot.service -f
+```
+
+If you don't see any recent warnings or errors and you see a message: "_Connected to signal-cli daemon socket_" or see it sending and receiving messages, then you can assume it is connected and running.
+
 To remove the services later:
 
-```bash
+```sh
 nix run .#uninstall
 ```
 
@@ -142,7 +146,7 @@ nix run .#uninstall
 
 Deployment is extremely simple.
 
-```
+```sh
 git push origin main
 ```
 
@@ -162,11 +166,11 @@ No manual deployment is required.
 
 Once you're in a nix development shell run:
 
-```
+```sh
 install-precommit-hooks
 ```
 
-You should now have precommit hooks that run type checks, linters, formatters and unit tests.
+You should now have precommit hookt hat runs type checks, linters, formatters and unit tests before you are allowed to commit.
 
 ### Run the bot locally
 
@@ -188,7 +192,7 @@ bot --config configs/test.toml
 
 ### Test the update process manually
 
-```
+```sh
 nix run .#poll-once
 ```
 
@@ -200,19 +204,19 @@ This performs one polling cycle.
 
 View the bot logs:
 
-```
+```sh
 journalctl -u bot.service -f
 ```
 
-View the signal-cli daemon logs:
+View the signal daemon logs:
 
-```
+```sh
 journalctl -u signal-daemon.service -f
 ```
 
 View deployment checks:
 
-```
+```sh
 journalctl -u bot-poll.service -f
 ```
 
@@ -222,29 +226,17 @@ journalctl -u bot-poll.service -f
 
 List timers:
 
-```
+```sh
 systemctl list-timers
 ```
 
 You should see:
 
-```
+```sh
 bot-poll.timer
 ```
 
 This runs once per minute.
-
----
-
-# Configuration
-
-## CLI options
-
-Configuration is passed through CLI flags and installer arguments. For service installation, use `nix run .#install -- --runtime --signal-account ... --repo-dir ...` and add `--verbose-level 1` or `--verbose-level 2` if you want daemon verbosity.
-
-```
-python -m bot --account +123456789 --state-path /srv/veganactivistsnl-bot/data/group_state.json
-```
 
 ---
 
@@ -274,6 +266,7 @@ Check service status:
 
 ```
 systemctl status bot.service
+systemctl status signal-daemon.service
 ```
 
 ---
@@ -282,6 +275,7 @@ systemctl status bot.service
 
 ```
 journalctl -u bot.service -n 100
+journalctl -u signal-daemon.service -n 100
 ```
 
 ---

@@ -18,15 +18,11 @@
       nixPython = "${pkgs.python312}/bin/python";
 
       runtimePkgs = with pkgs; [
-        bash
         git
-        gnused
         nix
         nushell
         python312
         signal-cli
-        systemd
-        util-linux
         uv
       ];
 

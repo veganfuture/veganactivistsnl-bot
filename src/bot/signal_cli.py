@@ -361,7 +361,7 @@ class SignalRpcClient:
                 last_error = exc
                 if time.monotonic() >= deadline:
                     break
-                logger.info(
+                logger.warning(
                     "Waiting for signal-cli daemon socket {}: {}",
                     self.socket_path,
                     exc,
