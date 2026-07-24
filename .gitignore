@@ -1,20 +1,18 @@
-# Python
-__pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-*.egg-info/
-.venv/
-.env
-tmp/
-run/
+# Ignore everything except directories
+*
+!*/
 
-# Bot state
-data/
+# Directories to blacklist
 configs/
+run/
+tmp/
 
-# Nix
-result
+# Specific files to whitelist
+!/.gitignore
+!LICENSE
 
-# Logs
-*.log
+# Allow file formats
+!*.md
+!*.lock
+!*.py
+!*.toml
