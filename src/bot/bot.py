@@ -8,10 +8,6 @@ from loguru import logger
 
 from bot.bot_feature import BotFeature
 from bot.config import BotConfig
-from bot.event_calendar_feature import (
-    EventCalendarFeature,
-    GeminiCalendarEventParser,
-)
 from bot.signal_cli import SignalClient, create_signal_client
 from bot.welcome_feature import WelcomeFeature
 
@@ -119,9 +115,4 @@ def _build_features(config: BotConfig, client: SignalClient) -> list[BotFeature]
     features: list[BotFeature] = []
     if config.welcome_feature is not None:
         features.append(WelcomeFeature(config.welcome_feature, client))
-    if config.event_calendar_feature is not None:
-        parser = GeminiCalendarEventParser(config.event_calendar_feature.gemini)
-        features.append(
-            EventCalendarFeature(config.event_calendar_feature, client, parser)
-        )
     return features

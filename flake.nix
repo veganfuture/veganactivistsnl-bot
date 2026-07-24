@@ -1,31 +1,33 @@
 {
-  description = "Signal bot (Nix provides python + signal-cli, pip provides deps)";
+  description = "Vegan Activsts NL Signal bot";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+    pre-commit-hooks.url = "github:cachix/git-hooks.nix";
   };
 
   outputs = {
     self,
     nixpkgs,
     flake-utils,
+    pre-commit-hooks,
   }:
     flake-utils.lib.eachDefaultSystem (system: let
       pkgs = import nixpkgs {inherit system;};
 
       repoDir = "/srv/veganactivistsnl-bot";
-      venvDir = "${repoDir}/.venv";
       tmpDir = "${repoDir}/tmp";
       runDir = "${repoDir}/run";
       signalSocketPath = "${runDir}/signal-cli.sock";
 
-      runtimePkgs = [
-        pkgs.bash
-        pkgs.coreutils
-        pkgs.git
-        pkgs.python3
-        pkgs.signal-cli
+      runtimePkgs = with pkgs; [
+        bash
+        coreutils
+        git
+        python3
+        signal-cli
+        uv
       ];
 
       runBot = pkgs.writeShellApplication {
@@ -39,20 +41,7 @@
           export TMPDIR="${tmpDir}"
           export JAVA_TOOL_OPTIONS="-Djava.io.tmpdir=${tmpDir}"
 
-          if [ ! -d "${venvDir}" ]; then
-            python -m venv "${venvDir}"
-          fi
-
-          # Activate venv
-          # shellcheck disable=SC1091
-          source "${venvDir}/bin/activate"
-
-          # Install deps (fast when already satisfied)
-          if [ -f requirements.txt ]; then
-            python -m pip install -r requirements.txt
-          fi
-
-          exec python -m bot \
+          uv run --frozen python -m bot \
             --signal-daemon-socket-path "${signalSocketPath}"
         '';
       };
@@ -140,7 +129,7 @@
 
       serviceUnit = pkgs.writeText "bot.service" ''
         [Unit]
-        Description=Signal bot (Nix runtime + pip venv)
+        Description=Vegan Activists NL Signal bot
         Requires=signal-cli-daemon.service
         After=signal-cli-daemon.service
         After=network-online.target
@@ -151,7 +140,6 @@
         User=ubuntu
         WorkingDirectory=${repoDir}
 
-        # Your bot gets signal-cli + python from Nix, deps from venv
         ExecStart=${runBot}/bin/bot-run
 
         Restart=always
@@ -252,45 +240,41 @@
       packages = {
         default = pkgs.signal-cli;
         signal-cli = pkgs.signal-cli;
-      };
-      devShells.default = pkgs.mkShell {
-        packages = [
-          pkgs.bash
-          pkgs.coreutils
-          pkgs.git
-          pkgs.python3
-          pkgs.signal-cli
-        ];
-        shellHook = ''
+
+        install-precommit-hooks = pkgs.writeScriptBin "install-precommit-hooks" ''
+          #!/usr/bin/env bash
+          ${self.checks.${system}.pre-commit-check.shellHook}
+        '';
+
+        typecheck-and-format = pkgs.writeScriptBin "typecheck-and-format" ''
+          #!/usr/bin/env bash
           set -euo pipefail
-
-          venv_dir="$PWD/.venv"
-          if [ ! -d "$venv_dir" ]; then
-            python -m venv "$venv_dir"
-          fi
-
-          # Activate venv
-          # shellcheck disable=SC1091
-          source "$venv_dir/bin/activate"
-
-          python -m pip install -U pip wheel setuptools
-
-          if [ -f requirements.txt ]; then
-            python -m pip install -r requirements.txt
-          fi
-
-          if [ -f requirements-dev.txt ]; then
-            python -m pip install -r requirements-dev.txt
-          fi
-
-          if [ -f .env ]; then
-            set -a
-            # shellcheck disable=SC1091
-            source .env
-            set +a
-          fi
+          uv run --dev --frozen pyrefly check .
+          uv run --dev --frozen ruff check --fix
         '';
       };
+      devShells.default = pkgs.mkShell {
+        packages = runtimePkgs ++ [self.packages.${system}.install-precommit-hooks];
+        shellHook = ''
+          uv sync --dev --frozen
+          source .venv/bin/activate
+        '';
+      };
+
+      checks = {
+        pre-commit-check = pre-commit-hooks.lib.${system}.run {
+          src = ./.;
+          hooks = {
+            typecheck-and-format = {
+              name = "typecheck-and-format";
+              types = ["python"];
+              enable = true;
+              entry = "${self.packages.${system}.typecheck-and-format}/bin/typecheck-and-format";
+            };
+          };
+        };
+      };
+
       apps = {
         install = {
           type = "app";
@@ -303,6 +287,10 @@
         run = {
           type = "app";
           program = "${runBot}/bin/bot-run";
+        };
+        install-precommit-hooks = {
+          type = "app";
+          program = "${self.packages.${system}.install-precommit-hooks}/bin/install-precommit-hooks";
         };
       };
     });

@@ -10,7 +10,7 @@ This project runs a **Signal bot** on a small Linux server (e.g. an AWS Lightsai
   * **restarts the bot**
   * Python dependencies are installed automatically
 
-The runtime environment is provided by **Nix**, while Python dependencies are installed using **pip** into a local virtual environment.
+The runtime environment is provided by **Nix**, while Python dependencies are installed using **uv** into a local virtual environment.
 
 This avoids containers, CI/CD pipelines, and complex deployment tools while still giving reproducible system dependencies.
 
@@ -25,7 +25,7 @@ The system has four parts:
 Nix provides the system-level tools:
 
 * Python
-* pip / venv
+* uv
 * signal-cli
 * git
 
